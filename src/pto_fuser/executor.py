@@ -12,6 +12,7 @@ they become active backends in M2+.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from typing import Callable, Dict, Optional
@@ -20,6 +21,33 @@ import torch
 
 from .ir import EinsumNode, OpaqueNode, Program, TensorOp, VecGlueNode
 from .registry import OpaqueRegistry, default_registry
+
+
+@contextlib.contextmanager
+def substrate_modes(read_mode: str = "auto", fuse_out: bool = True):
+    """Drive the substrate's documented lowering toggles for one einsum build.
+
+    The substrate auto-selects the read mode and the operand-swap-to-fused-store
+    from the equation+layout; these env knobs only let the fuser *forbid* an
+    optimization (to fall back to the always-valid baseline). `read_mode="NN"`
+    forces Phase-A (no direct read); `fuse_out=False` forbids the operand swap.
+    The defaults (`"auto"`, `True`) set nothing — the substrate decides.
+    """
+    overrides = {}
+    if read_mode == "NN":
+        overrides["EINSUM_DISABLE_NT"] = "1"
+    if not fuse_out:
+        overrides["EINSUM_DISABLE_OPERAND_SWAP"] = "1"
+    saved = {k: os.environ.get(k) for k in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
 
 
 def _load_substrate_einsum() -> Callable:
@@ -51,21 +79,24 @@ class StagedExecutor:
             self._einsum = _load_substrate_einsum()
         return self._einsum
 
-    def run(self, program: Program, bindings: Dict[str, torch.Tensor]
-            ) -> Dict[str, torch.Tensor]:
+    def run(self, program: Program, bindings: Dict[str, torch.Tensor],
+            return_env: bool = False) -> Dict[str, torch.Tensor]:
         missing = [n for n in program.inputs if n not in bindings]
         if missing:
             raise ValueError(f"missing bindings for inputs: {missing}")
         env: Dict[str, torch.Tensor] = dict(bindings)
         for node in program.nodes:
             env[node.output] = self._exec(node, env)
+        if return_env:                                       # planner needs the
+            return env                                       # staged intermediates
         return {name: env[name] for name in program.outputs}
 
     # -- per-node dispatch -------------------------------------------------- #
     def _exec(self, node, env: Dict[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(node, EinsumNode):
             a, b = (env[n] for n in node.inputs)
-            out = self.einsum(node.equation, a, b)          # substrate -> fp32
+            with substrate_modes(node.read_mode, node.fuse_out):
+                out = self.einsum(node.equation, a, b)       # substrate -> fp32
             return _cast(out, node.out_dtype)
         if isinstance(node, OpaqueNode):
             ins = [env[n] for n in node.inputs]

@@ -15,9 +15,11 @@ capture (M3) these collapse into buffer-binding metadata, not ops; they live in
 the IR now only because M1 is a host-driven staged executor.
 
 `read_mode` / `fuse_out` / `epilogue` / `prologue` on ``EinsumNode`` are **planner
-outputs**, not user input. The default lowering (NN, no fuse, no folded glue) is
-always a correct execution; M1 honors only the default and the planner (M2+) fills
-these in as gated annotations.
+outputs**, not user input. The default lowering is always a correct execution; the
+Planner (M2) sets `read_mode` / `fuse_out` per node by measuring the substrate's
+direct-read / fused-store lowering against the always-valid Phase-A NN baseline and
+keeping it only when gated-green and faster (see ``planner.py``). The executor
+honors these annotations via the substrate's documented mode toggles.
 """
 from __future__ import annotations
 
@@ -53,10 +55,19 @@ class EinsumNode(Node):
     inputs: List[str]
     output: str
     out_dtype: Optional[Any] = None     # cast the (fp32) substrate result; None = native
-    # --- planner annotations (M1: defaults only; M2 populates + gates) ---
-    read_mode: str = "NN"               # NN | NT | NN_strided | TN  (§2.11–2.13)
-    fuse_out: bool = False              # §2.9 fused permuted store
-    epilogue: Optional[list] = None     # glue folded into the store
+    # --- planner annotations (M2: set + gated by the Planner; see planner.py) ---
+    # The substrate auto-selects the read mode (NT/NN-strided/TN, §2.11–2.13) and the
+    # operand-swap-to-fused-store (§2.9) from the equation+layout; it exposes the
+    # documented toggles EINSUM_DISABLE_NT / EINSUM_DISABLE_OPERAND_SWAP. These two
+    # fields *select among* those (design §2), they do not re-implement them:
+    #   read_mode = "auto" -> let the substrate pick the direct-read mode (default);
+    #               "NN"   -> force the always-valid Phase-A NN lowering.
+    #   fuse_out  = True   -> permit the operand-swap that exposes the fused store
+    #               (default); False -> forbid the swap. The plain fused store still
+    #               auto-fires when free1 is already innermost regardless of this.
+    read_mode: str = "auto"             # auto | NN   (NT/NN_strided/TN chosen by substrate)
+    fuse_out: bool = True               # §2.9 / operand-swap permitted
+    epilogue: Optional[list] = None     # glue absorbed into the store (M2 detect / M4 codegen)
     prologue: Optional[list] = None     # per-operand scaling folded into the load
 
 
