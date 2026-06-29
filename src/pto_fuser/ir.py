@@ -102,6 +102,41 @@ class VecGlueNode(Node):
 
 
 @dataclass
+class FusedNode(Node):
+    """A sub-chain collapsed into ONE hand-fused kernel, hosted by key from the
+    fused-kernel registry (``fused.py``). This is the lever-5/6 backend (design §4):
+    a resident-state recurrence (``chunk_h_scan``) or a matmul-core + on-chip
+    epilogue (``kkt_gated``) that subsumes several staged stages into a single
+    dispatch, keeping intermediates (the carried state, the gated qk) on-chip
+    instead of round-tripping HBM.
+
+    Unlike the staged lowering it replaces, a fused kernel may produce **several**
+    outputs (the scan emits both per-chunk readouts and the final state), so this is
+    the one node type with an ``outputs`` *list*. It is kept only when the decision
+    procedure (``fusion.py``) gates it bit-faithful + deterministic vs the staged
+    lowering AND measures it faster — design §4 lever 6 ("last resort, narrow regime
+    only"), §6 (determinism gate mandatory on any fused lowering).
+
+    The hosted kernels are the proven prototype artifacts (``prototypes/kkt_fused``,
+    ``prototypes/chunk_h_scan``), built as their own ``.so`` and sharing GM with the
+    surrounding stages — which design §9 records as the form that *works today*. The
+    further step of inlining an opaque AICORE device-fn into one ``.so`` with the
+    substrate matmul core (the tri_inv case) stays unproven research; it is not used
+    here. ``inputs`` carry the logical operand names; the registry lowering owns the
+    layout/dtype adapters, exactly as the opaque registry does for tri_inv.
+    """
+    kernel: str
+    inputs: List[str]
+    outputs: List[str]
+    params: dict = field(default_factory=dict)
+    subsumes: List[str] = field(default_factory=list)   # staged outputs this replaces (doc/decision)
+
+    @property
+    def output(self) -> str:                            # primary, for messages
+        return self.outputs[0]
+
+
+@dataclass
 class TensorOp(Node):
     """Host tensor plumbing (no kernel): reshape | contiguous | transpose | cast |
     slice | stack | zeros. See module docstring — not a compute node type."""
@@ -133,7 +168,14 @@ class Program:
                     raise ValueError(
                         f"step producing {node.output!r} reads {name!r} before it is "
                         f"produced or bound as an input")
-            produced.add(node.output)
+            produced.update(node_outputs(node))   # FusedNode produces several
         missing = [o for o in self.outputs if o not in produced]
         if missing:
             raise ValueError(f"declared outputs never produced: {missing}")
+
+
+def node_outputs(node: Node) -> List[str]:
+    """The names a step binds into the environment. A `FusedNode` produces an
+    `outputs` list; every other node produces its single `output`."""
+    outs = getattr(node, "outputs", None)
+    return list(outs) if outs is not None else [node.output]

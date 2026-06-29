@@ -19,7 +19,9 @@ from typing import Callable, Dict, Optional
 
 import torch
 
-from .ir import EinsumNode, OpaqueNode, Program, TensorOp, VecGlueNode
+from .fused import FusedKernelRegistry, shared_fused_registry
+from .ir import (EinsumNode, FusedNode, OpaqueNode, Program, TensorOp,
+                 VecGlueNode, node_outputs)
 from .registry import OpaqueRegistry, default_registry
 
 
@@ -69,8 +71,10 @@ def _cast(t: torch.Tensor, dtype) -> torch.Tensor:
 
 class StagedExecutor:
     def __init__(self, registry: Optional[OpaqueRegistry] = None,
-                 einsum_fn: Optional[Callable] = None) -> None:
+                 einsum_fn: Optional[Callable] = None,
+                 fused: Optional[FusedKernelRegistry] = None) -> None:
         self.registry = registry or default_registry()
+        self.fused = fused or shared_fused_registry()   # lever-5/6 fused kernels (M4)
         self._einsum = einsum_fn          # lazily resolved so import works off-NPU
 
     @property
@@ -86,7 +90,11 @@ class StagedExecutor:
             raise ValueError(f"missing bindings for inputs: {missing}")
         env: Dict[str, torch.Tensor] = dict(bindings)
         for node in program.nodes:
-            env[node.output] = self._exec(node, env)
+            result = self._exec(node, env)
+            if isinstance(result, dict):                     # FusedNode: many outputs
+                env.update(result)
+            else:
+                env[node.output] = result
         if return_env:                                       # planner needs the
             return env                                       # staged intermediates
         return {name: env[name] for name in program.outputs}
@@ -101,6 +109,10 @@ class StagedExecutor:
         if isinstance(node, OpaqueNode):
             ins = [env[n] for n in node.inputs]
             return self.registry.run(node.kernel, ins, node.params)
+        if isinstance(node, FusedNode):
+            ins = [env[n] for n in node.inputs]
+            outs = self.fused.run(node.kernel, ins, node.params)
+            return {name: t for name, t in zip(node.outputs, outs)}
         if isinstance(node, VecGlueNode):
             return self._exec_glue(node, env)
         if isinstance(node, TensorOp):
@@ -137,6 +149,8 @@ class StagedExecutor:
             return x.contiguous()
         if op == "transpose":
             return x.transpose(*p["dims"])
+        if op == "permute":
+            return x.permute(*p["dims"]).contiguous()
         if op == "cast":
             return x.to(p["dtype"])
         if op == "slice":

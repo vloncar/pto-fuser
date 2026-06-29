@@ -12,12 +12,16 @@ example that the whole design is calibrated against.
 
 This is the **target**; [`IMPLEMENTATION.md`](IMPLEMENTATION.md) records the
 **realized state** and is kept in sync with it (currently: **M1 complete; M2 levers
-2 & 3 complete**, lever 4 detected with codegen staged for M4; **M3 graph capture
-complete** — staged chain captured + replayed as one dispatch, bit-exact, with the
-launch-bound dispatch-elim win measured). Any divergence
+2 & 3 complete**, lever 4 detected; **M3 graph capture complete** — staged chain
+captured + replayed as one dispatch, bit-exact, with the launch-bound dispatch-elim
+win measured; **M4 complete** — the fused-node backend hosts the resident-state scan
+(lever 5) and gated-kkt (lever 6) prototype kernels as capturable single-dispatch
+nodes, and the fusion decision procedure keeps each only where it gates bit-faithful
++ deterministic AND beats staged-captured: scan 4.4× / 2.3×, kkt 2.0×). Any divergence
 between the two — notably that levers 2/3 are realized *inside* the soft-frozen
-substrate and the fuser *selects among* them — is called out in that document's
-sync ledger.
+substrate and the fuser *selects among* them, and that M4 *hosts* the proven prototype
+kernels rather than templating epilogue codegen (the single-`.so` opaque inline of §9
+is left as unproven research) — is called out in that document's sync ledger.
 
 ---
 

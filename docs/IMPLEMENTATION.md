@@ -8,10 +8,13 @@ thing not yet in the design) is called out explicitly below.
 
 Status: **M1 complete. M2 levers 2 & 3 complete** (read-mode + operand-swap planner,
 gated + measured on the DeltaNet and GDN stages); M2 lever 4 (glue absorption) is
-**detected** here and its on-chip codegen is staged for M4. **M3 complete** (lever 1,
-graph capture: the staged chain is captured into one NPUGraph and replayed as a
-single dispatch — bit-exact, with the launch-bound dispatch-elim win measured). M4
-not started.
+**detected** in M2 and its on-chip fused kernel is **realized in M4**. **M3 complete**
+(lever 1, graph capture: the staged chain is captured into one NPUGraph and replayed
+as a single dispatch — bit-exact, with the launch-bound dispatch-elim win measured).
+**M4 complete** (levers 5 & 6: the fused-node backend hosts the resident-state scan
+and the gated-kkt prototype kernels as single-dispatch nodes, and the fusion decision
+procedure keeps a fused lowering only where it gates bit-faithful + deterministic AND
+beats staged-captured — measured per stage).
 
 ---
 
@@ -28,21 +31,27 @@ pto-fuser/
 │   ├── executor.py         # StagedExecutor + substrate_modes (honors the annotations)
 │   ├── planner.py          # M2 Planner — gate-and-measure lever selection
 │   ├── graph.py            # M3 graph-replay backend (CaptureExecutor + GraphReplayExecutor)
+│   ├── fused.py            # M4 fused-kernel registry (FusedKernel persistent runners)
+│   ├── fusion.py           # M4 decision procedure (FusionDecision: gate + measure)
 │   ├── gate.py             # frob_rel + determinism gates
 │   └── forwards/
 │       ├── deltanet.py     # the DeltaNet forward as an IR Program (+ fp32 reference)
-│       └── gdn.py          # the GDN contraction stages (2nd forward for the planner)
-├── prototypes/             # the design proofs (T0/T2/T3 seed kernels)
+│       ├── gdn.py          # the GDN contraction stages (2nd forward for the planner)
+│       └── fused_stages.py # M4 head-to-heads: staged Program + FusedNode + reference
+├── prototypes/             # the design proofs (T0/T2/T3 seed kernels, hosted by M4)
 ├── run_deltanet.py         # M1 driver: build → run staged → gate (any shape)
 ├── run_plan.py             # M2 driver: plan → decision ledger → gate the annotated prog
 ├── run_graph.py            # M3 driver: capture → replay → dispatch-elim sweep + gate
+├── run_fused.py            # M4 driver: staged-captured vs fused decision (gated + timed)
 └── tests/
     ├── test_ir.py          # IR structural validation (no NPU)
     ├── test_planner.py     # M2 planner keep-logic, injected measurements (no NPU)
     ├── test_graph.py       # M3 capture-mode toggle + replay-guard (no NPU)
+    ├── test_fused.py       # M4 FusedNode IR + registry + decision logic (no NPU)
     ├── test_deltanet_m1.py # M1 exit test: DeltaNet from IR, staged, gated (NPU)
     ├── test_m2_npu.py      # M2: planner levers on DeltaNet + GDN stages, gated (NPU)
-    └── test_m3_npu.py      # M3: capture/replay bit-exact + determinism + dispatch win (NPU)
+    ├── test_m3_npu.py      # M3: capture/replay bit-exact + determinism + dispatch win (NPU)
+    └── test_m4_npu.py      # M4: fused scan/kkt correctness + determinism + decision (NPU)
 ```
 
 The package depends on the pinned `pto-einsum` substrate (sibling repo by default,
@@ -303,11 +312,88 @@ python run_graph.py --B 2 --H 4                          # dispatch-elim sweep, 
 python run_graph.py --B 8 --H 32 --nc 1 4 16 32          # crossover to perf-neutral
 ```
 
-## M4 — selective fused-node + resident-state  ⬜ not started
+## M4 — selective fused-node + resident-state  ✅ (levers 5 & 6)
 
-Lever 6 (opaque AICORE inline + matmul-core epilogue codegen) and lever 5, only for
-the regimes M3 leaves on the table, each behind a measured launch-bound justification
-and a determinism gate.
+Exit criterion (design §8): *a documented decision per stage — staged-captured vs
+fused — with the measurement that chose it.* **Met** — the fused-node backend hosts
+two proven prototype kernels as single-dispatch nodes, and the decision procedure
+keeps each only where it gates bit-faithful + deterministic AND beats staged-captured.
+
+### What graph capture (M3) leaves on the table
+
+M3 made graph-replay the default backend: it removes per-stage *dispatch* cost but
+**not** the HBM round-trip of intermediates *between* stages. Two stages pay that
+round-trip heavily, and they are the two M4 levers:
+
+- **lever 5 (resident state, T2 `chunk_h_scan`)** — the staged scan unrolls the
+  cross-chunk recurrence into `nc` per-chunk matmul pairs and writes the carried
+  state `S` back to HBM every chunk; the fused kernel keeps `S` resident (a matmul
+  operand *and* a Vec accumulator) across all chunks.
+- **lever 6 (glue absorption, T0 `kkt_gated`)** — the staged kkt lands the qk matrix
+  in HBM, then a Vec epilogue reads it back to gate + mask; the fused kernel folds the
+  gated/masked epilogue into the matmul store, so qk never leaves on-chip.
+
+### Fused-node backend (`fused.py`, IR `FusedNode`, executor branch)
+
+A **`FusedNode`** (the one IR node with an `outputs` *list* — a fused kernel may
+produce several, e.g. the scan's per-chunk readouts + final state) names a kernel in
+the **`FusedKernelRegistry`**. The registry lazily compiles the prototype `.cpp` into
+a cached `.so` keyed by its compile-time shape (`KKT_NC`/`KKT_H`; `SCAN_B/H/NC`) and
+wraps it in a **persistent `FusedKernel`**: `setup` allocates the on-chip-state
+workspace once, `run` is a pure stream launch (no host sync), `teardown` frees it.
+The launch is sync-free precisely so a `FusedNode` is **graph-capturable** — the M3
+`CaptureExecutor` runs it unchanged (single dispatch already; capture removes even
+that one host launch). Operand layout/dtype adapters live in the registered lowering,
+exactly as the opaque registry does for tri_inv.
+
+The hosted kernels are the proven prototype artifacts (`prototypes/kkt_fused`,
+`prototypes/chunk_h_scan`), built as their **own `.so` sharing GM** with the
+surrounding stages — the form design §9 records as *working today*. The further step
+of inlining an opaque AICORE device-fn into **one** `.so` with the substrate matmul
+core (the tri_inv case, §9 build-flag reconciliation) stays **unproven research and is
+not used here** — see the sync ledger.
+
+### Decision procedure (`fusion.py`) — design §4 lever 6, §6, §8
+
+`decide(stage, kernel, staged, fused)` runs both lowerings on identical inputs and
+returns a `FusionDecision`:
+- **frob gate** — fused output ≡ staged output (design §6: a broken fused pipeline
+  fails here);
+- **determinism gate** — fused run twice, bit-identical (design §6: mandatory on any
+  fused/scan lowering — the guard that caught the historical mega H=64 NDET);
+- **measurement** — both backends timed back-to-back + one trailing sync.
+
+The fused lowering is **kept only if** gated-green, deterministic, *and* faster;
+otherwise the staged-captured lowering stands (the lever-ordering rule — reach for a
+fused kernel only on a measured win).
+
+### Measured (frob ≡ staged, determinism, and ms/call; healthy NPU)
+
+| stage | lever | shape | staged-captured | fused | speedup | frob | det | kept |
+|-------|-------|-------|----------------:|------:|--------:|-----:|:---:|:----:|
+| `chunk_h_scan` | 5 (resident state) | B1 H4 nc8   | 0.504 ms | 0.114 ms | **4.40×** | 0.0 | ✅ | ✅ |
+| `chunk_h_scan` | 5 (resident state) | B8 H32 nc16 | 8.489 ms | 3.722 ms | **2.28×** | 0.0 | ✅ | ✅ |
+| `kkt_gated`    | 6 (glue absorption) | nc8 H4 (vs torch-staged) | 0.219 ms | 0.112 ms | **1.96×** | 3.3e-6 | ✅ | ✅ |
+
+The scan's fused output is **bit-identical** to the staged lowering (`frob = 0.0`,
+both eager and captured) and both match the fp32 reference (h_out 2.7e-4, final
+3.3e-4). Notably the resident-state win is **not** confined to the launch-bound
+regime: it holds at B8 H32 (2.28×) because what it removes is the per-chunk *HBM
+round-trip of `S`*, a bandwidth cost graph capture cannot touch — so unlike monolithic
+fusion (design §4 lever 6, "narrow regime only"), lever 5 fuses broadly. The kkt fold
+(lever 6) likewise wins by keeping qk on-chip. Both decisions: **FUSE**.
+
+### Verification
+
+```bash
+pytest                                              # 35 passed (off-NPU + NPU)
+python run_fused.py --B 1 --H 4 --nc 8              # both stages, gated decision
+python run_fused.py --B 8 --H 32 --nc 16 --stage scan   # resident-state at scale
+```
+
+The driver auto-selects a healthy NPU (the box is shared — a chip pinned by a
+neighbor job, or wedged by an aicore timeout, is skipped); pass `--device npu:N` to
+pin one.
 
 ---
 
@@ -334,10 +420,11 @@ docs stay honest:
   auto/NN. The fired mode is still recorded (in the `LeverDecision` ledger) for
   reporting. On-plan, narrower surface.
 - **Lever 4 (glue absorption) is split M2/M4.** M2 *detects* foldable
-  `VecGlueNode → EinsumNode` pairs (`absorption_candidates`); the on-chip *codegen*
-  (matmul-core + epilogue) is the fused-node backend, which §5 names as the only
-  backend emitting new device code and §8 places its build-flag reconciliation in M4
-  (§9 risk). Glue still lowers host-side (M1 path) until then. On-plan.
+  `VecGlueNode → EinsumNode` pairs (`absorption_candidates`); the on-chip fold
+  (matmul-core + epilogue) is the **M4 fused-node backend** — realized as the
+  `kkt_gated` `FusedNode` (qk + gated/masked epilogue in one kernel, 1.96× and qk
+  never lands in HBM). The fold is *hosted* from the proven prototype kernel, not yet
+  auto-generated from an `EinsumNode.epilogue` op list (see next entry). On-plan.
 - **Second forward is GDN *contraction stages*, not the full GDN forward.** The four
   contractions exercise every read-mode lever; the gating cumsum / GQA repeat /
   chunk_h resident-state recurrence (lever 5) are M4. On-plan (§8 says "GDN/DeltaNet
@@ -359,4 +446,31 @@ docs stay honest:
   (perf-neutral compute-bound, 2.4–4.0× launch-bound) and enforces the §9 static-shape
   assumption with an explicit shape-mismatch error on replay. Shape *bucketing* (a
   family of captures) is still deferred — single-shape capture is what M3 builds.
+- **M4 fused nodes are *hosted prototype kernels*, not yet IR-driven codegen.** Design
+  §5 names the fused-node backend "the only backend that emits *new* device code." M4
+  realizes it by hosting the two proven hand-written prototype kernels
+  (`kkt_fused`, `chunk_h_scan`) as `FusedNode`s with persistent runners — the device
+  code exists (the prototypes *are* the codegen reference), but it is selected by
+  registry key, not templated from an `EinsumNode.epilogue`/`prologue` op list. The
+  decision procedure, the gate discipline, the capturable single-dispatch backend, and
+  the per-stage measurement (the §8 M4 exit) are all realized; *automatic* epilogue
+  templating is the remaining codegen step. Recorded so "emits new device code" is not
+  over-read as "generates it from the IR."
+- **Single-`.so` opaque inline (lever 6's hardest form) is NOT attempted — by design.**
+  §9 flags reconciling the opaque AICORE kernel's build flags with the substrate's
+  inside one `.so` as "M4 research, not assumed." M4 uses only the form §9 says works
+  today: each fused kernel is its own `.so` sharing GM with the staged stages around
+  it (and the opaque tri_inv stays a separate hosted node). The inline ABI is left as
+  open research — claimed nowhere. On-plan (honours the §9 risk boundary).
+- **`FusedNode` is the one multi-output IR node.** §3 fixes three single-output
+  compute node types; a fused kernel legitimately produces several tensors (the scan's
+  per-chunk readouts + final state), so `FusedNode` carries an `outputs` list and the
+  executor updates the env with all of them (`node_outputs` / dict result). A backend
+  detail of lever 6, not a new compute surface — the three node *types* are unchanged.
+- **Lever 5 (resident state) wins beyond the launch-bound regime.** Design §4 frames
+  the fused path as "narrow regime only" (true for monolithic lever 6). The scan
+  measurement shows lever 5 fuses at B8 H32 too (2.28×), because it removes the
+  per-chunk *HBM round-trip of `S`* — a bandwidth cost, not a dispatch cost. The
+  decision procedure keeps it on the measurement, exactly as intended; recorded as a
+  sharper-than-designed finding, not a contradiction.
 - No design element is contradicted by the implementation.
