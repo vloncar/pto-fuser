@@ -14,8 +14,13 @@ can host but that are not the matmul-core shape.
 
 ## Layout
 
-- `DESIGN.md` — the auto-fuser design (IR, planner levers, codegen targets,
-  milestones). *(to be written — phase 1)*
+- `docs/FUSER_DESIGN.md` — the auto-fuser design (thesis, IR, planner levers,
+  codegen targets, correctness gating, milestones).
+- `docs/IMPLEMENTATION.md` — what is actually built so far, tracked against the
+  design. The two are kept in sync: the design states the target, the
+  implementation doc records the realized state per milestone.
+- `src/pto_fuser/` — the package: the IR, the staged executor, the opaque-kernel
+  registry, the correctness gates, and the reference forwards built on them.
 - `prototypes/` — the design proofs that established the substrate spans every
   chunk-attention family. These are the seed reference kernels for the fuser:
   - `kkt_fused/` — **T0**: einsum-core matmul + on-chip gated epilogue fused into
