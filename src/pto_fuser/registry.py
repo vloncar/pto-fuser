@@ -22,10 +22,31 @@ from __future__ import annotations
 
 import os
 import sys
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
+
+
+# When True, opaque lowerings omit their eager stream-ordering `synchronize()`s.
+# The graph-replay backend (graph.py) sets this *inside the capture region only*:
+# there the raw kernel launch is recorded on the capture stream in program order,
+# so the host syncs are both unnecessary and capture-breaking (a host sync aborts
+# capture). Outside capture the syncs are load-bearing — leave this False.
+_CAPTURE_MODE = False
+
+
+@contextlib.contextmanager
+def capture_mode():
+    """Mark a region as graph-capture: opaque lowerings drop their host syncs."""
+    global _CAPTURE_MODE
+    prev = _CAPTURE_MODE
+    _CAPTURE_MODE = True
+    try:
+        yield
+    finally:
+        _CAPTURE_MODE = prev
 
 
 @dataclass
@@ -98,9 +119,11 @@ def _tri_inv_lowering(tri_inv: Callable, inputs: List[torch.Tensor],
     out = torch.zeros_like(A_upper, dtype=torch.float32)
     mi = torch.zeros((C, C), dtype=torch.float16, device=A_lower.device)
     mi.fill_diagonal_(-1)
-    torch.npu.synchronize()                        # order the raw launch vs the stream
+    if not _CAPTURE_MODE:
+        torch.npu.synchronize()                    # order the raw launch vs the stream
     tri_inv(out, A_upper, mi, C, M, 0, cu_seqlens=None, block_dim=min(20, M))
-    torch.npu.synchronize()
+    if not _CAPTURE_MODE:                           # under capture the launch is
+        torch.npu.synchronize()                    # recorded on the capture stream
     return out.transpose(-1, -2).contiguous()      # (I+A)^-1, lower, fp32
 
 

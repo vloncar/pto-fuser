@@ -8,7 +8,10 @@ thing not yet in the design) is called out explicitly below.
 
 Status: **M1 complete. M2 levers 2 & 3 complete** (read-mode + operand-swap planner,
 gated + measured on the DeltaNet and GDN stages); M2 lever 4 (glue absorption) is
-**detected** here and its on-chip codegen is staged for M4. M3–M4 not started.
+**detected** here and its on-chip codegen is staged for M4. **M3 complete** (lever 1,
+graph capture: the staged chain is captured into one NPUGraph and replayed as a
+single dispatch — bit-exact, with the launch-bound dispatch-elim win measured). M4
+not started.
 
 ---
 
@@ -24,6 +27,7 @@ pto-fuser/
 │   ├── registry.py         # opaque-kernel registry (tri_inv_rec_unroll)
 │   ├── executor.py         # StagedExecutor + substrate_modes (honors the annotations)
 │   ├── planner.py          # M2 Planner — gate-and-measure lever selection
+│   ├── graph.py            # M3 graph-replay backend (CaptureExecutor + GraphReplayExecutor)
 │   ├── gate.py             # frob_rel + determinism gates
 │   └── forwards/
 │       ├── deltanet.py     # the DeltaNet forward as an IR Program (+ fp32 reference)
@@ -31,11 +35,14 @@ pto-fuser/
 ├── prototypes/             # the design proofs (T0/T2/T3 seed kernels)
 ├── run_deltanet.py         # M1 driver: build → run staged → gate (any shape)
 ├── run_plan.py             # M2 driver: plan → decision ledger → gate the annotated prog
+├── run_graph.py            # M3 driver: capture → replay → dispatch-elim sweep + gate
 └── tests/
     ├── test_ir.py          # IR structural validation (no NPU)
     ├── test_planner.py     # M2 planner keep-logic, injected measurements (no NPU)
+    ├── test_graph.py       # M3 capture-mode toggle + replay-guard (no NPU)
     ├── test_deltanet_m1.py # M1 exit test: DeltaNet from IR, staged, gated (NPU)
-    └── test_m2_npu.py      # M2: planner levers on DeltaNet + GDN stages, gated (NPU)
+    ├── test_m2_npu.py      # M2: planner levers on DeltaNet + GDN stages, gated (NPU)
+    └── test_m3_npu.py      # M3: capture/replay bit-exact + determinism + dispatch win (NPU)
 ```
 
 The package depends on the pinned `pto-einsum` substrate (sibling repo by default,
@@ -225,16 +232,76 @@ stages are the right unit for the M2 lever decision.
 ### Verification
 
 ```bash
-pytest                                                  # 13 passed (off-NPU + NPU)
+pytest                                                  # 23 passed (off-NPU + NPU)
 python run_plan.py --B 4 --H 16 --nc 8 --C 64 --D 128   # decision ledger, ALL OK
 ```
 
-## M3 — graph capture  ⬜ not started
+## M3 — graph capture  ✅ (lever 1, dispatch-elim)
 
-Lever 1: wrap the staged chain in an NPUGraph capture, replay as one dispatch. The
-`Program`'s ordered static node list is already the right representation; the
-`TensorOp` plumbing becomes buffer-binding metadata. Static-shape / bucketing is
-the open risk (design §9).
+Lever 1: wrap the staged chain in an NPUGraph capture and replay it as a single
+dispatch. The `Program`'s ordered static node list is already the right
+representation; `graph.py` adds the backend.
+
+**Two prerequisites, both supplied by the backend.** A region is capturable only if
+it contains (a) no JIT/codegen and (b) no per-call host sync:
+
+1. **No JIT inside capture.** The substrate's one-shot `einsum()` *rebuilds* the
+   kernel every call (codegen + dlopen + first-call workspace setup — all host
+   work). `CaptureExecutor` (a `StagedExecutor` subclass) instead builds a
+   **persistent** `EinsumBuilder(...).build()` runner per node *once* — keyed by
+   `(equation, shapes, dtype, read_mode, fuse_out)` so the planner's M2 annotations
+   are honored at build time — and reuses it. The captured region is then pure
+   device launches. (This persistent-runner path is also the fair dispatch baseline:
+   the win measured is *graph vs persistent-staged*, not vs the rebuild-every-call
+   convenience.)
+2. **No host sync.** The opaque tri_inv lowering syncs to order its raw launch
+   against the torch stream. `registry.capture_mode()` (a module flag, set by the
+   backend **inside the capture region only**) drops those two `synchronize()`s; the
+   launch is recorded on the capture stream in order, so they are both unnecessary
+   and capture-breaking. This is what makes the *full* DeltaNet forward — opaque node
+   included — capture as one graph. (Mega is not capturable for the dual reason: a
+   per-call `cu.cpu()` host read; precisely the overhead staged-captured removes.)
+
+**`GraphReplayExecutor`** — `capture(program, bindings)` clones the inputs into
+static buffers, warms up eagerly (builds every runner, runs the one-time workspace
+setup, primes caches), then captures one `run(...)` into an `NPUGraph`, keeping
+references to the pool-resident output tensors. `replay(bindings)` copies the new
+operands into the static buffers, replays, and returns the outputs (cloned by
+default; `clone=False` in tight measurement loops). A replay whose shape differs
+from capture raises — static-shape is enforced, not silently wrong (design §9).
+
+### Measured — DeltaNet forward, graph-replay vs persistent-staged
+
+The "T" axis is the chunk count (`T = nc·C`); ms/call over back-to-back launches +
+one trailing sync (what exposes host dispatch). Every row bit-exact vs staged
+(`frob_rel = 0`) and gated vs the fp32 reference.
+
+| regime | shape | T | staged | graph | speedup |
+|--------|-------|---|-------:|------:|--------:|
+| launch-bound | B2 H4 | 64 (nc1) | 0.85 ms | 0.30 ms | **2.9×** |
+| launch-bound | B2 H4 | 128 (nc2) | 1.54 ms | 0.38 ms | **4.0×** |
+| launch-bound | B2 H4 | 1024 (nc16) | 3.23 ms | 1.33 ms | **2.4×** |
+| crossover | B8 H32 | 64 (nc1) | 1.02 ms | 0.89 ms | 1.15× |
+| compute-bound | B8 H32 | 256 (nc4) | 3.49 ms | 3.48 ms | 1.00× |
+| compute-bound | B8 H32 | 2048 (nc32) | 34.8 ms | 35.6 ms | 0.98× |
+
+The dispatch-elim win is **regime-specific**, exactly as design §4 lever 1 predicts:
+a real multiplier where host launch dominates (small batch, and/or few large
+chunks), and free/perf-neutral (within timing jitter) once device work per launch
+hides the dispatch. Small-batch DeltaNet stays launch-bound across the whole nc
+sweep because each unrolled scan stage is a tiny matmul; larger `B·H` crosses to
+compute-bound by `nc≈4`. Graph capture never meaningfully regresses — so it is the
+right **default** backend for any static-shape chain. Each GDN contraction stage
+also captures and replays bit-exact (the direct-read equation family), confirming
+the backend generalizes beyond the worked example.
+
+### Verification
+
+```bash
+pytest tests/test_graph.py tests/test_m3_npu.py -q       # off-NPU + NPU, green
+python run_graph.py --B 2 --H 4                          # dispatch-elim sweep, ALL OK
+python run_graph.py --B 8 --H 32 --nc 1 4 16 32          # crossover to perf-neutral
+```
 
 ## M4 — selective fused-node + resident-state  ⬜ not started
 
@@ -275,4 +342,21 @@ docs stay honest:
   contractions exercise every read-mode lever; the gating cumsum / GQA repeat /
   chunk_h resident-state recurrence (lever 5) are M4. On-plan (§8 says "GDN/DeltaNet
   stages").
+- **M3 needs a persistent-runner executor the design does not name.** Design §5
+  describes graph-replay as "the staged chain wrapped in an NPUGraph capture," but
+  the staged executor's one-shot `einsum()` rebuilds per call (host work) and is not
+  capturable. `CaptureExecutor` (persistent runners, M2 annotations honored at build)
+  is the realized form of "the staged chain" for capture — an implementation
+  necessity, not a design change. It is also the fair dispatch baseline.
+- **Opaque nodes are captured by dropping their stream syncs.** §4 lever 1 says "the
+  captured region must contain no per-call host sync"; the tri_inv lowering has two.
+  `registry.capture_mode()` drops them inside the capture region only (the raw launch
+  is recorded on the capture stream in order) — so the *full* DeltaNet, opaque node
+  included, captures. On-plan: it realizes the §4 constraint rather than excluding the
+  opaque node from capture.
+- **Graph capture is the default backend, measured.** §5 calls graph-replay "the
+  default production backend for static-shape chains"; M3 confirms it never regresses
+  (perf-neutral compute-bound, 2.4–4.0× launch-bound) and enforces the §9 static-shape
+  assumption with an explicit shape-mismatch error on replay. Shape *bucketing* (a
+  family of captures) is still deferred — single-shape capture is what M3 builds.
 - No design element is contradicted by the implementation.

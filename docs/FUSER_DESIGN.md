@@ -12,7 +12,9 @@ example that the whole design is calibrated against.
 
 This is the **target**; [`IMPLEMENTATION.md`](IMPLEMENTATION.md) records the
 **realized state** and is kept in sync with it (currently: **M1 complete; M2 levers
-2 & 3 complete**, lever 4 detected with codegen staged for M4). Any divergence
+2 & 3 complete**, lever 4 detected with codegen staged for M4; **M3 graph capture
+complete** — staged chain captured + replayed as one dispatch, bit-exact, with the
+launch-bound dispatch-elim win measured). Any divergence
 between the two — notably that levers 2/3 are realized *inside* the soft-frozen
 substrate and the fuser *selects among* them — is called out in that document's
 sync ledger.

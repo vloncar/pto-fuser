@@ -21,9 +21,10 @@ can host but that are not the matmul-core shape.
   implementation doc records the realized state per milestone.
 - `src/pto_fuser/` — the package: the IR, the staged executor, the opaque-kernel
   registry, the correctness gates, the read-mode/fused-store **Planner** (`planner.py`),
-  and the reference forwards (DeltaNet, GDN contraction stages) built on them.
-  Drivers: `run_deltanet.py` (M1, staged + gate) and `run_plan.py` (M2, plan +
-  decision ledger).
+  the **graph-replay backend** (`graph.py`, M3 — capture the staged chain, replay as
+  one dispatch), and the reference forwards (DeltaNet, GDN contraction stages) built
+  on them. Drivers: `run_deltanet.py` (M1, staged + gate), `run_plan.py` (M2, plan +
+  decision ledger), and `run_graph.py` (M3, capture/replay + dispatch-elim sweep).
 - `prototypes/` — the design proofs that established the substrate spans every
   chunk-attention family. These are the seed reference kernels for the fuser:
   - `kkt_fused/` — **T0**: einsum-core matmul + on-chip gated epilogue fused into
