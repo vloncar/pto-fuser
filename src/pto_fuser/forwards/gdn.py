@@ -1,14 +1,13 @@
-"""GDN contraction stages — the second reference forward for the M2 planner.
+"""GDN contraction stages — the second reference forward for the planner.
 
-Design §8: "A second reference forward (GDN or KDA ...) is added once M2 lands, to
-confirm the planner generalizes." GDN shares the kkt/wy/chunk_h/chunk_o stages with
+A second reference forward (GDN or KDA) confirms the planner generalizes. GDN shares the kkt/wy/chunk_h/chunk_o stages with
 DeltaNet but in a **different equation family** — the head axis ``h`` is a
-non-innermost batch axis, which is exactly what drives the substrate's NT /
+non-innermost batch axis, which is exactly what drives the library's NT /
 NN-strided / TN direct reads (§2.11–2.13). The full GDN forward additionally needs
 the gating cumsum, GQA repeat, and the chunk_h cross-chunk recurrence with resident
-state (lever 5 = M4); those are glue around the same four contractions, so for the
-M2 planner — whose job is the read-mode/fused-store lever decision per contraction
-— the four contraction stages are the unit that exercises every lever.
+state (the resident-state feature); those are glue around the same four contractions,
+so for the planner — whose job is the read-mode / fused-store decision per contraction
+— the four contraction stages are the unit that exercises every read mode.
 
 The four stages (regular-nc, chunk loop folded into the leading batch ``b = B*nc``;
 shapes mirror ``benchmarks/complex/gdn/einsum_gdn.py``):

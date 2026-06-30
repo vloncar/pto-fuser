@@ -1,2 +1,5 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "npu: test requires a healthy Ascend NPU (deselect off-NPU with -m 'not npu')",
+]

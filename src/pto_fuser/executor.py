@@ -1,14 +1,14 @@
-"""Staged executor — the M1 baseline backend.
+"""Staged executor — the baseline backend.
 
 Runs a `Program` node-by-node over a name->tensor environment. Each `EinsumNode`
-dispatches to its own substrate `.so` (persistent-workspace setup/exec/teardown,
+dispatches to its own library `.so` (persistent-workspace setup/exec/teardown,
 handled inside `pto_einsum`); stages share GM tensors through the environment.
 This is the correctness reference every other backend (graph-replay, fused-node)
 is gated against (docs/FUSER_DESIGN.md §5–6).
 
 The executor honors only the **default** einsum lowering (NN, no fused store, no
 folded glue). Planner annotations on `EinsumNode` are intentionally ignored here;
-they become active backends in M2+.
+they become active when the read-mode / fused-store selection runs.
 """
 from __future__ import annotations
 
@@ -26,14 +26,14 @@ from .registry import OpaqueRegistry, default_registry
 
 
 @contextlib.contextmanager
-def substrate_modes(read_mode: str = "auto", fuse_out: bool = True):
-    """Drive the substrate's documented lowering toggles for one einsum build.
+def library_modes(read_mode: str = "auto", fuse_out: bool = True):
+    """Drive the library's documented lowering toggles for one einsum build.
 
-    The substrate auto-selects the read mode and the operand-swap-to-fused-store
+    The library auto-selects the read mode and the operand-swap-to-fused-store
     from the equation+layout; these env knobs only let the fuser *forbid* an
     optimization (to fall back to the always-valid baseline). `read_mode="NN"`
     forces Phase-A (no direct read); `fuse_out=False` forbids the operand swap.
-    The defaults (`"auto"`, `True`) set nothing — the substrate decides.
+    The defaults (`"auto"`, `True`) set nothing — the library decides.
     """
     overrides = {}
     if read_mode == "NN":
@@ -52,8 +52,8 @@ def substrate_modes(read_mode: str = "auto", fuse_out: bool = True):
                 os.environ[k] = old
 
 
-def _load_substrate_einsum() -> Callable:
-    """Import `einsum` from the pinned pto-einsum substrate (sibling repo by
+def _load_library_einsum() -> Callable:
+    """Import `einsum` from the pinned pto-einsum library (sibling repo by
     default; override with PTO_EINSUM)."""
     einsum_root = os.environ.get(
         "PTO_EINSUM",
@@ -74,13 +74,13 @@ class StagedExecutor:
                  einsum_fn: Optional[Callable] = None,
                  fused: Optional[FusedKernelRegistry] = None) -> None:
         self.registry = registry or default_registry()
-        self.fused = fused or shared_fused_registry()   # lever-5/6 fused kernels (M4)
+        self.fused = fused or shared_fused_registry()   # resident-state / glue-absorption fused kernels
         self._einsum = einsum_fn          # lazily resolved so import works off-NPU
 
     @property
     def einsum(self) -> Callable:
         if self._einsum is None:
-            self._einsum = _load_substrate_einsum()
+            self._einsum = _load_library_einsum()
         return self._einsum
 
     def run(self, program: Program, bindings: Dict[str, torch.Tensor],
@@ -103,8 +103,8 @@ class StagedExecutor:
     def _exec(self, node, env: Dict[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(node, EinsumNode):
             a, b = (env[n] for n in node.inputs)
-            with substrate_modes(node.read_mode, node.fuse_out):
-                out = self.einsum(node.equation, a, b)       # substrate -> fp32
+            with library_modes(node.read_mode, node.fuse_out):
+                out = self.einsum(node.equation, a, b)       # library -> fp32
             return _cast(out, node.out_dtype)
         if isinstance(node, OpaqueNode):
             ins = [env[n] for n in node.inputs]

@@ -1,9 +1,9 @@
 """Planner keep-logic — off-NPU, with injected measurements (proven teeth).
 
-The decision rule (design §8 M2) is: keep a lever only when it *fired* (the
-substrate changed the lowering), the result is *gated-green* (frob_rel < tol vs the
+The decision rule (design §8) is: keep a feature only when it *fired* (the
+library changed the lowering), the result is *gated-green* (frob_rel < tol vs the
 baseline), AND it is *faster*. These tests script each of those three gates failing
-in isolation and assert the verdict, with no NPU and no real substrate build.
+in isolation and assert the verdict, with no NPU and no real library build.
 """
 import torch
 

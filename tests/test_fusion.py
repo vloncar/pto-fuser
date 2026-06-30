@@ -1,4 +1,4 @@
-"""M4 structural tests (no NPU): the FusedNode IR, multi-output plumbing, the
+"""Fusion structural tests (no NPU): the FusedNode IR, multi-output plumbing, the
 fused-kernel registry surface, and the FusionDecision verdict logic."""
 import pytest
 

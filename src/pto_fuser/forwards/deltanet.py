@@ -1,6 +1,6 @@
 """The chunked DeltaNet forward, expressed as an IR `Program`.
 
-This is the M1 worked example (docs/FUSER_DESIGN.md §7): the same pipeline as
+This is the worked example (docs/FUSER_DESIGN.md §7): the same pipeline as
 `prototypes/deltanet_chunk/delta_e2e.py`, but written as a declarative program of
 the three compute node types (+ host TensorOps) instead of hardcoded Python, and
 run by the generic `StagedExecutor`. Pure DeltaNet (gate g = 0): the per-element

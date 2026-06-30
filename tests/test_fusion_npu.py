@@ -1,13 +1,13 @@
-"""M4 exit test (NPU): the fused-node backend + fusion decision (levers 5/6).
+"""Fusion tests (NPU): the fused-node backend + the staged-vs-fused decision.
 
 Asserts the backend's contract, not a fixed speedup (timings vary, esp. on a shared
 box):
-  * the fused resident-state scan (lever 5) and the fused gated kkt (lever 6) each
+  * the fused resident-state scan and the fused gated kkt each
     match the fp32 reference, and the scan's fused output is **bit-identical** to the
     staged lowering it replaces (same numerics, one kernel vs many);
   * both fused kernels are deterministic (run twice, bit-identical — design §6,
     mandatory on any fused lowering);
-  * a fused node captures + replays through the M3 graph backend (single dispatch),
+  * a fused node captures + replays through the graph-replay backend (single dispatch),
     bit-exact;
   * `fusion.decide` keeps the scan fusion (it gates green, is deterministic, and is
     faster than staged-captured — the resident state removes the per-chunk HBM
@@ -26,9 +26,21 @@ from pto_fuser.forwards import (build_kkt_fused_program, build_scan_fused_progra
                                 build_scan_staged_program, kkt_reference,
                                 make_kkt_inputs, make_scan_inputs, scan_reference)
 
-DEV = healthy_npu()
-pytestmark = pytest.mark.skipif(DEV is None, reason="M4 fused-node test needs a healthy Ascend NPU")
+pytestmark = pytest.mark.npu
+DEV = None
 TOL = 2e-2
+
+
+@pytest.fixture(autouse=True)
+def _device():
+    """Resolve a healthy NPU lazily (at test time, not collection time — probing a
+    wedged chip at import would hang the whole suite on a shared box)."""
+    global DEV
+    if DEV is None:
+        DEV = healthy_npu()
+    if DEV is None:
+        pytest.skip("no healthy Ascend NPU")
+    torch.npu.set_device(DEV)
 
 
 def _bitexact(got, ref):

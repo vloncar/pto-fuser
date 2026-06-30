@@ -4,22 +4,21 @@ A program is an ordered list of steps over named tensors (an environment that
 maps name -> torch.Tensor). The design (docs/FUSER_DESIGN.md §3) fixes **three
 compute node types**, proved sufficient by the chunk-attention taxonomy:
 
-  * ``EinsumNode``   — one substrate contraction (the core unit).
+  * ``EinsumNode``   — one library contraction (the core unit).
   * ``OpaqueNode``   — a foreign hand-optimized kernel the matmul-core can't express.
   * ``VecGlueNode``  — a standalone Vector op (mask / scale / elementwise residual).
 
 `TensorOp` is **not** a fourth compute type: it is host tensor plumbing — views,
 reshapes, casts, slices, stacks, allocations — that a *staged* executor needs to
-wire intermediates between kernels. It carries no device kernel. Under graph
-capture (M3) these collapse into buffer-binding metadata, not ops; they live in
-the IR now only because M1 is a host-driven staged executor.
+wire intermediates between kernels. It carries no device kernel. Under graph capture these collapse into buffer-binding metadata, not ops; they live
+in the IR only because the staged executor is host-driven.
 
 `read_mode` / `fuse_out` / `epilogue` / `prologue` on ``EinsumNode`` are **planner
 outputs**, not user input. The default lowering is always a correct execution; the
-Planner (M2) sets `read_mode` / `fuse_out` per node by measuring the substrate's
+The planner sets `read_mode` / `fuse_out` per node by measuring the library's
 direct-read / fused-store lowering against the always-valid Phase-A NN baseline and
 keeping it only when gated-green and faster (see ``planner.py``). The executor
-honors these annotations via the substrate's documented mode toggles.
+honors these annotations via the library's documented mode toggles.
 """
 from __future__ import annotations
 
@@ -50,24 +49,24 @@ class Node:
 
 @dataclass
 class EinsumNode(Node):
-    """One substrate contraction. `inputs` are exactly two operand names."""
+    """One library contraction. `inputs` are exactly two operand names."""
     equation: str
     inputs: List[str]
     output: str
-    out_dtype: Optional[Any] = None     # cast the (fp32) substrate result; None = native
-    # --- planner annotations (M2: set + gated by the Planner; see planner.py) ---
-    # The substrate auto-selects the read mode (NT/NN-strided/TN, §2.11–2.13) and the
+    out_dtype: Optional[Any] = None     # cast the (fp32) library result; None = native
+    # --- planner annotations (set + gated by the Planner; see planner.py) ---
+    # The library auto-selects the read mode (NT/NN-strided/TN, §2.11–2.13) and the
     # operand-swap-to-fused-store (§2.9) from the equation+layout; it exposes the
     # documented toggles EINSUM_DISABLE_NT / EINSUM_DISABLE_OPERAND_SWAP. These two
     # fields *select among* those (design §2), they do not re-implement them:
-    #   read_mode = "auto" -> let the substrate pick the direct-read mode (default);
+    #   read_mode = "auto" -> let the library pick the direct-read mode (default);
     #               "NN"   -> force the always-valid Phase-A NN lowering.
     #   fuse_out  = True   -> permit the operand-swap that exposes the fused store
     #               (default); False -> forbid the swap. The plain fused store still
     #               auto-fires when free1 is already innermost regardless of this.
-    read_mode: str = "auto"             # auto | NN   (NT/NN_strided/TN chosen by substrate)
+    read_mode: str = "auto"             # auto | NN   (NT/NN_strided/TN chosen by library)
     fuse_out: bool = True               # §2.9 / operand-swap permitted
-    epilogue: Optional[list] = None     # glue absorbed into the store (M2 detect / M4 codegen)
+    epilogue: Optional[list] = None     # glue absorbed into the store (planner detects; fused-node backend emits)
     prologue: Optional[list] = None     # per-operand scaling folded into the load
 
 
@@ -90,7 +89,7 @@ class OpaqueNode(Node):
 class VecGlueNode(Node):
     """A standalone Vector op not (yet) absorbed into an adjacent contraction.
 
-    M1 lowers these via torch (host-side); M2's glue-absorption pass (lever 4) is
+    The staged executor lowers these via torch (host-side); the glue-absorption pass is
     what folds bandwidth-bound glue into an `EinsumNode` epilogue/prologue. `op`
     is one of: tril | add | sub | mul | scale.
     """
@@ -114,14 +113,14 @@ class FusedNode(Node):
     outputs (the scan emits both per-chunk readouts and the final state), so this is
     the one node type with an ``outputs`` *list*. It is kept only when the decision
     procedure (``fusion.py``) gates it bit-faithful + deterministic vs the staged
-    lowering AND measures it faster — design §4 lever 6 ("last resort, narrow regime
+    lowering AND measures it faster — design §4 ("monolithic fusion: last resort, narrow regime
     only"), §6 (determinism gate mandatory on any fused lowering).
 
     The hosted kernels are the proven prototype artifacts (``prototypes/kkt_fused``,
     ``prototypes/chunk_h_scan``), built as their own ``.so`` and sharing GM with the
     surrounding stages — which design §9 records as the form that *works today*. The
     further step of inlining an opaque AICORE device-fn into one ``.so`` with the
-    substrate matmul core (the tri_inv case) stays unproven research; it is not used
+    library matmul core (the tri_inv case) stays unproven research; it is not used
     here. ``inputs`` carry the logical operand names; the registry lowering owns the
     layout/dtype adapters, exactly as the opaque registry does for tri_inv.
     """
@@ -152,7 +151,7 @@ class Program:
 
     `inputs` are bound at run time; `outputs` are returned by the executor.
     The order is the execution order (the unrolled static chain — exactly the
-    shape graph capture wants in M3).
+    shape graph capture wants).
     """
     nodes: List[Node]
     inputs: List[str]

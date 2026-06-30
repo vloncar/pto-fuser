@@ -1,14 +1,13 @@
-"""pto-fuser — the fusion / auto-fuser layer over the pto-einsum substrate.
+"""pto-fuser — the fusion / auto-fuser layer over the pto-einsum library.
 
 Surface: the three-node IR, the staged executor, the opaque-kernel registry, the
-correctness gates (M1), the read-mode / fused-store Planner (M2), the graph-replay
-backend (M3, dispatch-elim), and the fused-node backend + fusion decision procedure
-(M4, levers 5/6). See docs/FUSER_DESIGN.md (design) and docs/IMPLEMENTATION.md
+correctness gates, the read-mode / fused-store Planner, the graph-replay backend
+(dispatch elimination), and the fused-node backend + the staged-vs-fused decision. See docs/FUSER_DESIGN.md (design) and docs/IMPLEMENTATION.md
 (realized state).
 """
 from .ir import (EinsumNode, FusedNode, Node, OpaqueNode, Program, TensorOp,
                  TensorRef, VecGlueNode)
-from .executor import StagedExecutor, substrate_modes
+from .executor import StagedExecutor, library_modes
 from .registry import (OpaqueContract, OpaqueRegistry, capture_mode,
                        default_registry)
 from .fused import (FusedContract, FusedKernel, FusedKernelRegistry,
@@ -21,7 +20,7 @@ from .fusion import FusionDecision, decide, format_decisions as format_fusion_de
 
 __all__ = [
     "TensorRef", "Node", "EinsumNode", "OpaqueNode", "VecGlueNode", "TensorOp",
-    "FusedNode", "Program", "StagedExecutor", "substrate_modes", "OpaqueRegistry",
+    "FusedNode", "Program", "StagedExecutor", "library_modes", "OpaqueRegistry",
     "OpaqueContract", "default_registry", "capture_mode", "GateResult",
     "FusedContract", "FusedKernel", "FusedKernelRegistry",
     "default_fused_registry", "shared_fused_registry",

@@ -4,3 +4,7 @@ __pycache__/
 build/
 .venv/
 *.egg-info/
+
+# generated benchmark artifacts (plots + result dumps)
+examples/benchmarks/*.png
+examples/benchmarks/*.json

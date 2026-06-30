@@ -1,6 +1,6 @@
-"""Graph-replay backend — M3, planner lever #1 (dispatch-elim).
+"""Graph-replay backend — the dispatch-elimination feature.
 
-`docs/FUSER_DESIGN.md` §4 lever 1 / §5 "Graph-replay": an NPUGraph captures the
+`docs/FUSER_DESIGN.md` §4 (graph capture) / §5 "Graph-replay": an NPUGraph captures the
 staged chain's per-stage ctypes launches and replays them as a *single* dispatch.
 This collapses N per-stage host launches into one — the win that lets a staged
 pipeline *beat* a monolithic mega kernel in the launch-bound small-`T` regime
@@ -8,7 +8,7 @@ pipeline *beat* a monolithic mega kernel in the launch-bound small-`T` regime
 
 Two things make a chain capturable, and this backend supplies both:
 
-1. **No JIT inside the capture region.** The substrate's one-shot ``einsum()``
+1. **No JIT inside the capture region.** The library's one-shot ``einsum()``
    rebuilds the kernel (codegen + dlopen + first-call workspace setup) on every
    call — all host work, none of it capturable. `CaptureExecutor` instead builds a
    *persistent* einsum runner per node once (honoring the planner's read-mode /
@@ -37,7 +37,7 @@ from typing import Dict, Optional
 import torch
 
 from . import registry as _registry
-from .executor import StagedExecutor, _cast, substrate_modes
+from .executor import StagedExecutor, _cast, library_modes
 from .ir import EinsumNode, Program
 from .registry import OpaqueRegistry
 
@@ -69,8 +69,8 @@ class CaptureExecutor(StagedExecutor):
         if runner is None:
             from pto_einsum import EinsumBuilder       # noqa: import-after-path
             # The read-mode/fused-store toggles affect *codegen*, so they must be
-            # set while build() runs, not at launch (cf. executor.substrate_modes).
-            with substrate_modes(node.read_mode, node.fuse_out):
+            # set while build() runs, not at launch (cf. executor.library_modes).
+            with library_modes(node.read_mode, node.fuse_out):
                 runner = EinsumBuilder(
                     node.equation, [a.shape, b.shape], a.dtype).build()
             self._runners[key] = runner

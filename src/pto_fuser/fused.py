@@ -4,7 +4,7 @@ A ``FusedNode`` names a hand-fused kernel that subsumes a staged sub-chain into 
 dispatch, keeping intermediates on-chip. The registry maps that name to a recipe
 that (lazily) compiles the prototype ``.cpp`` into a cached ``.so`` and to a
 persistent runner: ``setup`` allocates the on-chip-state workspace once, ``run``
-launches the kernel (no host sync — so the node is graph-capturable, M3), and the
+launches the kernel (no host sync — so the node is graph-capturable), and the
 runner is reused across calls. Operand layout/dtype adapters and output allocation
 live in the registered lowering, exactly as the opaque registry does for tri_inv.
 
@@ -12,10 +12,10 @@ Two seed entries, both proven prototypes built as their own ``.so`` sharing GM w
 the surrounding stages (design §9: *this* form works today; single-``.so`` opaque
 inline is the unproven part and is not used here):
 
-  * ``chunk_h_scan`` — the T2 resident-state recurrence (lever 5). State ``S`` stays
+  * ``chunk_h_scan`` — the resident-state recurrence. State ``S`` stays
     resident across chunks (matmul operand + Vec accumulator); the staged lowering
     round-trips ``S`` through HBM every chunk.
-  * ``kkt_gated``    — the T0 matmul-core + on-chip gated/masked epilogue (lever 6 /
+  * ``kkt_gated``    — the matmul-core + on-chip gated/masked epilogue (glue absorption /
     glue absorption). The qk intermediate never lands in HBM.
 
 Compile-time shape (``KKT_NC``/``KKT_H``; ``SCAN_B``/``SCAN_H``/``SCAN_NC``) keys the
@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-_PROTO = os.path.abspath(os.path.join(HERE, "..", "..", "prototypes"))
+_KERNELS = os.path.join(HERE, "kernels")
 KKT_C = KKT_D = 128
 SCAN_C = SCAN_D = 128
 
@@ -93,7 +93,7 @@ class FusedKernel:
 
     ``run(inputs, params)`` adapts operands, launches the kernel on the current
     stream (no host sync — capturable), and returns the output tensors. The
-    persistent workspace mirrors the substrate's persistent-runner discipline (M3):
+    persistent workspace mirrors the library's persistent-runner discipline:
     setup/teardown are amortized, ``run`` is pure launch.
     """
 
@@ -161,7 +161,7 @@ class FusedKernelRegistry:
 
 
 # --------------------------------------------------------------------------- #
-#  chunk_h_scan — the T2 resident-state recurrence (lever 5)
+#  chunk_h_scan — the resident-state recurrence
 # --------------------------------------------------------------------------- #
 def _scan_bind(lib: ctypes.CDLL) -> None:
     lib.scan_setup.restype = ctypes.c_void_p
@@ -170,7 +170,7 @@ def _scan_bind(lib: ctypes.CDLL) -> None:
 
 
 def _scan_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
-    w, u, k, decay = inputs                       # [B,nc,C,H,D] half ×3, [B,H,nc] f32
+    w, u, k, decay = inputs   # [B,nc,C,H,D] half ×3; decay [B,H,nc] f32 (scalar) or [B,H,nc,D] (per-dim)
     B, H, nc = params["B"], params["H"], params["nc"]
     dev = w.device
     h_out = torch.zeros(B, nc, H, SCAN_D, SCAN_D, device=dev, dtype=torch.float16)
@@ -181,7 +181,7 @@ def _scan_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
 
 
 # --------------------------------------------------------------------------- #
-#  kkt_gated — matmul-core + on-chip gated/masked epilogue (lever 6)
+#  kkt_gated — matmul-core + on-chip gated/masked epilogue (glue absorption)
 # --------------------------------------------------------------------------- #
 def _kkt_bind(lib: ctypes.CDLL) -> None:
     lib.kkt_setup.restype = ctypes.c_void_p
@@ -209,17 +209,20 @@ def _kkt_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
 def default_fused_registry() -> FusedKernelRegistry:
     reg = FusedKernelRegistry()
     reg.register("chunk_h_scan", _Recipe(
-        src_dir=os.path.join(_PROTO, "chunk_h_scan"), src_file="scan_lib.cpp",
-        defines=lambda p: {"SCAN_B": p["B"], "SCAN_H": p["H"], "SCAN_NC": p["nc"]},
+        src_dir=_KERNELS, src_file="scan_lib.cpp",
+        defines=lambda p: {"SCAN_B": p["B"], "SCAN_H": p["H"], "SCAN_NC": p["nc"],
+                           **({"SCAN_PERDIM_DECAY": 1} if p.get("perdim_decay") else {})},
         setup_sym="scan_setup", teardown_sym="scan_teardown",
         bind=_scan_bind, launch=_scan_launch,
         contract=FusedContract(
             in_slots=["w", "u", "k", "decay"],
             in_dtypes=[torch.float16, torch.float16, torch.float16, torch.float32],
             out_names=["h_out", "final"], out_dtype=torch.float16,
-            notes="resident-state chunk recurrence; C=D=128; w/u/k [B,nc,C,H,D]")))
+            notes="resident-state chunk recurrence; C=D=128; w/u/k [B,nc,C,H,D]; "
+                  "decay [B,H,nc] scalar (GDN) or [B,H,nc,D] per-dim (KDA, "
+                  "perdim_decay=True -> SCAN_PERDIM_DECAY keys a distinct .so)")))
     reg.register("kkt_gated", _Recipe(
-        src_dir=os.path.join(_PROTO, "kkt_fused"), src_file="kkt_fused_lib.cpp",
+        src_dir=_KERNELS, src_file="kkt_fused_lib.cpp",
         defines=lambda p: {"KKT_NC": p["nc"], "KKT_H": p["H"]},
         setup_sym="kkt_setup", teardown_sym="kkt_teardown",
         bind=_kkt_bind, launch=_kkt_launch,

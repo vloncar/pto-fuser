@@ -1,18 +1,17 @@
-"""M2 planner — gate-and-measure lever selection over the public substrate knobs.
+"""Planner — gate-and-measure feature selection over the public library knobs.
 
-Design §4 levers 2 and 3 (read-mode NT/NN-strided/TN, and operand-swap → fused
-store) are realized **inside the soft-frozen substrate**: it auto-selects them from
+The read-mode (NT/NN-strided/TN) and operand-swap → fused-store features are realized **inside the soft-frozen library**: it auto-selects them from
 the equation+layout and exposes the documented toggles ``EINSUM_DISABLE_NT`` /
 ``EINSUM_DISABLE_OPERAND_SWAP``. Per design §2 the fuser *selects among* these
-substrate capabilities; it does not re-implement them. So the planner, for each
+library capabilities; it does not re-implement them. So the planner, for each
 distinct ``EinsumNode`` contraction:
 
-  1. measures the substrate's optimized lowering against the always-valid Phase-A
+  1. measures the library's optimized lowering against the always-valid Phase-A
      NN baseline on that node's real operands;
   2. **frob-gates** the two equivalent (design §6 — a broken lowering that produced
      zero/garbage would fail here);
   3. keeps the optimization only when gated-green **and** faster than the baseline
-     (design §8 M2: "kept only where gated-green and faster than default").
+     ("kept only where gated-green and faster than default").
 
 The output is an annotated ``Program`` (each ``EinsumNode``'s ``read_mode`` /
 ``fuse_out`` pinned to the kept choice) plus a per-node ``LeverDecision`` ledger.
@@ -20,11 +19,11 @@ Distinct contractions are measured once and reused (the DeltaNet scan repeats th
 same two shapes ``nc`` times), so planning a 600-node program costs a handful of
 builds.
 
-Lever 4 (glue absorption) is a *detector* here (`absorption_candidates`): it finds
+Glue absorption is a *detector* here (`absorption_candidates`): it finds
 ``VecGlueNode`` → ``EinsumNode`` adjacencies whose intermediate round-trips HBM and
 could be folded into the contraction's epilogue/prologue. The actual on-chip fold
 is the fused-node backend (design §5) — the one place the fuser emits new device
-code — and is staged for M4 with the ``kkt_fused`` prototype as its evidence.
+code — and is realized by the fused-node backend, with the ``kkt_fused`` kernel as its evidence.
 """
 from __future__ import annotations
 
@@ -34,7 +33,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from .executor import StagedExecutor, substrate_modes, _load_substrate_einsum
+from .executor import StagedExecutor, library_modes, _load_library_einsum
 from .gate import frob_rel
 from .ir import EinsumNode, Program, VecGlueNode
 
@@ -45,7 +44,7 @@ class LeverDecision:
     node: str           # the EinsumNode output name (representative of the shape class)
     equation: str
     lever: str          # "direct_read" | "operand_swap"
-    fired: bool         # the substrate actually changed the lowering vs forced-NN
+    fired: bool         # the library actually changed the lowering vs forced-NN
     gated_ok: bool      # frob_rel(candidate, baseline) < tol
     faster: bool        # candidate wall-clock < baseline
     kept: bool          # fired and gated_ok and faster
@@ -77,7 +76,7 @@ class Planner:
     """Selects + gates the read-mode / fused-store levers per EinsumNode.
 
     `measure` is injectable so the keep-logic is testable off-NPU; the default
-    builds + times the real substrate kernel.
+    builds + times the real library kernel.
     """
 
     def __init__(self, executor: Optional[StagedExecutor] = None, *, tol: float = 2e-2,
@@ -87,7 +86,7 @@ class Planner:
         self.tol = tol
         self.warmup = warmup
         self.iters = iters
-        self._measure = measure or self._measure_substrate
+        self._measure = measure or self._measure_library
         self._Builder = None
 
     # -- public API --------------------------------------------------------- #
@@ -121,7 +120,7 @@ class Planner:
     def absorption_candidates(self, program: Program) -> List[Tuple[str, str]]:
         """Lever-4 detector: (glue_output, einsum_output) pairs where a VecGlueNode
         feeds straight into an EinsumNode (an HBM round-trip the fused-node backend
-        could fold into an epilogue/prologue). Detection only — codegen is M4."""
+        could fold into an epilogue/prologue). Detection only — codegen is the fused-node backend."""
         producer = {}
         for node in program.nodes:
             producer[node.output] = node
@@ -174,14 +173,14 @@ class Planner:
 
     def _builder(self):
         if self._Builder is None:
-            _load_substrate_einsum()              # ensures pto-einsum is importable
+            _load_library_einsum()              # ensures pto-einsum is importable
             from pto_einsum import EinsumBuilder   # noqa: import-after-path
             self._Builder = EinsumBuilder
         return self._Builder
 
-    def _measure_substrate(self, eq, a, b, *, read_mode, fuse_out) -> _Measurement:
+    def _measure_library(self, eq, a, b, *, read_mode, fuse_out) -> _Measurement:
         Builder = self._builder()
-        with substrate_modes(read_mode, fuse_out):
+        with library_modes(read_mode, fuse_out):
             builder = Builder(eq, [tuple(a.shape), tuple(b.shape)], a.dtype)
             runner = builder.build()
             for _ in range(self.warmup):

@@ -1,4 +1,4 @@
-"""M3 exit test (NPU): the graph-replay backend captures the staged chain and
+"""Graph-replay tests (NPU): the backend captures the staged chain and
 replays it as one dispatch — bit-exact, deterministic, and faster in the
 launch-bound regime.
 
@@ -23,8 +23,8 @@ from pto_fuser import CaptureExecutor, GraphReplayExecutor, gate_outputs
 from pto_fuser.forwards import (build_deltanet_program, deltanet_reference,
                                 gdn_contraction_stages, make_inputs)
 
-pytestmark = pytest.mark.skipif(
-    not torch.npu.is_available(), reason="M3 graph-replay test needs an Ascend NPU")
+pytestmark = [pytest.mark.npu, pytest.mark.skipif(
+    not torch.npu.is_available(), reason="graph-replay test needs an Ascend NPU")]
 
 BITEXACT = 1e-12  # graph replay reruns the same kernels: frob_rel is exactly 0.0
 

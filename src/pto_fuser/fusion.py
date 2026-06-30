@@ -1,12 +1,12 @@
-"""Fusion decision procedure — the M4 exit (design §4 lever 6, §6, §8).
+"""Fusion decision procedure — the staged-vs-fused decision (design §4, §6, §8).
 
-M3 made graph-capture the default backend: a staged chain replayed as one dispatch,
+Graph capture is the default backend: a staged chain replayed as one dispatch,
 perf-neutral-to-winning everywhere. Lever 6 (a single hand-fused kernel) is the
 *last resort* — design §4 keeps it "only where launch-bound small-`T` justifies it
 and graph capture is insufficient." What graph capture does **not** remove is the
 HBM round-trip of intermediates between stages: the resident state ``S`` of the
 chunk scan, or the qk matrix of kkt. A fused kernel keeps those on-chip. Whether
-that beats staged-captured is an *empirical, per-stage* question — so M4's
+that beats staged-captured is an *empirical, per-stage* question — so the fusion decision's
 deliverable is a measured decision, not a blanket "fuse everything."
 
 `decide` runs both lowerings of one stage on identical inputs and returns a

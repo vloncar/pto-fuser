@@ -133,6 +133,59 @@ AICORE inline void vec_recurrence(__gm__ half* S_gm, __gm__ const float* KV_gm, 
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1); wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
 }
 
+// ── Vec: per-dim recurrence S = diag(dvec)·S + kv (dvec[k] scales S row k) ─────
+// KDA's cross-chunk decay is a per-dimension vector (one rate per K-row of S),
+// unlike GDN's single scalar. Broadcast dvec[D] across the V columns with
+// TROWEXPAND (the kkt_fused row-broadcast idiom) and TMUL, in full f32. To fit the
+// 192 KB UB beside the live sh/sf tiles, the [D,D] broadcast tile reuses kv's slot
+// — kv isn't needed until the final TADD, so it is loaded *after* the decay multiply.
+template <typename P>
+AICORE inline void vec_recurrence_perdim(__gm__ half* S_gm, __gm__ const float* KV_gm,
+                                         __gm__ const float* dvec) {
+    constexpr unsigned D = P::D;
+    using TileH  = Tile<TileType::Vec, half,  D, D, BLayout::RowMajor, -1, -1>;
+    using TileF  = Tile<TileType::Vec, float, D, D, BLayout::RowMajor, -1, -1>;
+    using TileDr = Tile<TileType::Vec, float, 1, D, BLayout::RowMajor, -1, -1>;  // decay [1,D] load
+    using TileDc = Tile<TileType::Vec, float, D, 1, BLayout::ColMajor, -1, -1>;  // [D,1] alias (same bytes)
+    using GmH    = GlobalTensor<half,  Shape<1,1,1,-1,D>, Stride<1,1,1,D,1>>;
+    using GmF    = GlobalTensor<float, Shape<1,1,1,-1,D>, Stride<1,1,1,D,1>>;
+    using GmDr   = GlobalTensor<float, Shape<1,1,1,1,-1>, Stride<1,1,1,D,1>>;
+    // resident S(half) -> sf(float)
+    TileH sh; TASSIGN(sh, 0);       sh.SetValidRow(D); sh.SetValidCol(D);
+    GmH gs(S_gm, Shape<1,1,1,-1,D>(D));
+    TLOAD(sh, gs);
+    // per-dim decay vector [D] loaded just past kv's slot (kv not loaded yet)
+    TileDr dr; TASSIGN(dr, D*D*2 + D*D*4 + D*D*4);  dr.SetValidRow(1); dr.SetValidCol(D);
+    GmDr gd(const_cast<__gm__ float*>(dvec), Shape<1,1,1,1,-1>(D));
+    TLOAD(dr, gd);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    TileF sf; TASSIGN(sf, D*D*2);   sf.SetValidRow(D); sf.SetValidCol(D);
+    TCVT(sf, sh, RoundMode::CAST_RINT);
+    pipe_barrier(PIPE_V);
+    // dexp[i,j] = dvec[i] — alias the loaded vector as a [D,1] col, expand into kv's slot
+    TileDc dc;   TASSIGN(dc, D*D*2 + D*D*4 + D*D*4);  dc.SetValidRow(D); dc.SetValidCol(1);
+    TileF dexp;  TASSIGN(dexp, D*D*2 + D*D*4);        dexp.SetValidRow(D); dexp.SetValidCol(D);
+    TROWEXPAND(dexp, dc);
+    pipe_barrier(PIPE_V);
+    TMUL(sf, sf, dexp);                        // row-scale S by the per-dim decay
+    pipe_barrier(PIPE_V);
+    // WAR: the kv load (MTE2) overwrites dexp's slot, so the TMUL read of dexp (V)
+    // must complete first — pipe_barrier(PIPE_V) orders V-vs-V only, not V-vs-MTE2.
+    // Missing this edge races at H>=32 (cores loop over units) -> NDET, gate rejects.
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2); wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+    // kv now loaded into its slot (overwrites dexp), then accumulate
+    TileF kv; TASSIGN(kv, D*D*2 + D*D*4);  kv.SetValidRow(D); kv.SetValidCol(D);
+    GmF gk(const_cast<__gm__ float*>(KV_gm), Shape<1,1,1,-1,D>(D));
+    TLOAD(kv, gk);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+    TADD(sf, sf, kv);
+    pipe_barrier(PIPE_V);
+    TCVT(sh, sf, RoundMode::CAST_RINT);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(gs, sh);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1); wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+}
+
 // ── Vec: store final state final[b,h] = S ────────────────────────────────────
 template <typename P>
 AICORE inline void vec_store_final(__gm__ const half* S_gm, __gm__ half* final_gm) {
@@ -196,8 +249,13 @@ __global__ AICORE void scan_kernel(__gm__ const half* w, __gm__ const half* u,
                 ffts_cross_core_sync(PIPE_MTE3, pto_einsum::GetffstMsg(0x2, F_RES));
 
                 wait_flag_dev(F_MM2); pipe_barrier(PIPE_ALL);
+#ifdef SCAN_PERDIM_DECAY
+                __gm__ const float* dvec = decay + (int64_t)((b * H + h) * NC + c) * D;
+                vec_recurrence_perdim<P>(S_base, KV_base, dvec);
+#else
                 float dval = decay[(int64_t)(b * H + h) * NC + c];
                 vec_recurrence<P>(S_base, KV_base, dval);
+#endif
                 ffts_cross_core_sync(PIPE_MTE3, pto_einsum::GetffstMsg(0x2, F_REC));
             }
         }

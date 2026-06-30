@@ -1,6 +1,6 @@
-"""M3 off-NPU tests — graph-replay backend structure (no device required).
+"""Graph-replay off-NPU tests — backend structure (no device required).
 
-The capture/replay behaviour itself needs an NPU (see test_m3_npu.py); here we
+The capture/replay behaviour itself needs an NPU (see test_graph_npu.py); here we
 cover the host-side contract: the capture-mode toggle that lets opaque lowerings
 drop their stream syncs, and the guard that replay cannot run before capture.
 """

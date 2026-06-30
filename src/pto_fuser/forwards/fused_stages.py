@@ -1,4 +1,4 @@
-"""Head-to-head stages for the M4 fusion decision (design §7, §8 M4).
+"""Head-to-head stages for the staged-vs-fused decision (design §7).
 
 Each stage is provided in **two** equivalent lowerings over identical inputs, so
 `fusion.decide` can gate (frob ≡ + determinism) and time them against each other:
@@ -8,12 +8,12 @@ Each stage is provided in **two** equivalent lowerings over identical inputs, so
   * a **fused** `Program` — a single `FusedNode` hosting the proven prototype kernel
     that keeps the stage's intermediate on-chip.
 
-Two stages, the two M4 levers:
+Two stages, the two fusion features:
 
-  * ``chunk_h_scan`` (lever 5, resident state): the staged lowering unrolls the
+  * ``chunk_h_scan`` (resident state): the staged lowering unrolls the
     cross-chunk recurrence into ``nc`` per-chunk matmul pairs, round-tripping the
     state ``S`` through HBM every chunk; the fused kernel keeps ``S`` resident.
-  * ``kkt_gated`` (lever 6, glue absorption): the staged lowering is the qk
+  * ``kkt_gated`` (glue absorption): the staged lowering is the qk
     contraction + a gated/masked Vec epilogue with the qk matrix landing in HBM; the
     fused kernel folds the epilogue into the matmul store.
 
@@ -29,7 +29,7 @@ C = D = 128
 
 
 # --------------------------------------------------------------------------- #
-#  chunk_h_scan  (lever 5 — resident state)
+#  chunk_h_scan  (resident state)
 # --------------------------------------------------------------------------- #
 def make_scan_inputs(B: int, H: int, nc: int, device="npu:0") -> dict:
     """Prototype-layout operands (token-major [B,nc,C,H,D]); contractive scale so
@@ -122,7 +122,7 @@ def build_scan_staged_program(B: int, H: int, nc: int) -> Program:
 
 
 # --------------------------------------------------------------------------- #
-#  kkt_gated  (lever 6 — glue absorption)
+#  kkt_gated  (glue absorption)
 # --------------------------------------------------------------------------- #
 def make_kkt_inputs(nc: int, H: int, device="npu:0") -> dict:
     """Operands for the gated kkt: normalized k [1,T,H,D] half, prefix-summed gate

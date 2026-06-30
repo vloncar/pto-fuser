@@ -1,9 +1,9 @@
-"""M2 exit test (NPU): the Planner measures levers 2/3 on the DeltaNet and GDN
+"""Planner tests (NPU): read-mode / fused-store selection on the DeltaNet and GDN
 contraction stages, and the lever-pinned program stays gated-green.
 
 Asserts the planner's contract, not a fixed speedup (timings vary by machine):
   * every decision is self-consistent — kept iff fired & gated & faster;
-  * the substrate's direct-read lowering is bit-equivalent to the Phase-A baseline
+  * the library's direct-read lowering is bit-equivalent to the Phase-A baseline
     on every stage (gated_ok), which is the correctness half of the lever;
   * the annotated DeltaNet program still matches the fp32 reference.
 """
@@ -17,8 +17,8 @@ from pto_fuser import Planner, StagedExecutor, gate_outputs
 from pto_fuser.forwards import (build_deltanet_program, deltanet_reference,
                                 gdn_contraction_stages, make_inputs)
 
-pytestmark = pytest.mark.skipif(
-    not torch.npu.is_available(), reason="M2 planner test needs an Ascend NPU")
+pytestmark = [pytest.mark.npu, pytest.mark.skipif(
+    not torch.npu.is_available(), reason="planner test needs an Ascend NPU")]
 
 
 def _check_consistency(decisions):

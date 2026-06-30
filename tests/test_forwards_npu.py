@@ -1,6 +1,6 @@
-"""M1 exit test: the DeltaNet forward runs from IR, staged, gated green.
+"""DeltaNet forward tests: the forward runs from IR, staged, gated green.
 
-Requires an NPU (compiles + runs real substrate kernels). The CI shape is small
+Requires an NPU (compiles + runs real library kernels). The CI shape is small
 for speed; the M=16384 exit shape is exercised by `run_deltanet.py`.
 """
 import os
@@ -15,8 +15,8 @@ from pto_fuser import StagedExecutor, gate_determinism, gate_outputs
 from pto_fuser.forwards import (build_deltanet_program, deltanet_reference,
                                 make_inputs)
 
-pytestmark = pytest.mark.skipif(
-    not torch.npu.is_available(), reason="DeltaNet M1 test needs an Ascend NPU")
+pytestmark = [pytest.mark.npu, pytest.mark.skipif(
+    not torch.npu.is_available(), reason="DeltaNet test needs an Ascend NPU")]
 
 
 @pytest.mark.parametrize("B,H,nc,C,D", [(1, 2, 3, 64, 128)])
