@@ -173,14 +173,17 @@ The fused lowering keeps `S` on-chip across chunks (the gated recurrence is mapp
 kernel by absorbing the per-token gate into `k` and feeding the decay separately; `v_new` is
 recovered as one parallel batched matmul). GDN's decay is a single scalar `exp(gₗ)` per chunk;
 **KDA's is a per-dimension `[D]` vector** `exp(g_tot)` (one rate per `K`-row of `S`), which the
-kernel applies with a row-broadcast (`TROWEXPAND`) + `TMUL` under a `SCAN_PERDIM_DECAY` build
-flag (a distinct `.so`; GDN's stays byte-identical). It is wired in **behind the fusion-decide
+kernel applies with a single fused `TROWEXPANDMUL` (the decay vector expanded down the columns
+and multiplied into `S` in one instruction — no materialized broadcast tile) under a
+`SCAN_PERDIM_DECAY` build flag (a distinct `.so`; GDN's stays byte-identical). It is wired in **behind the fusion-decide
 gate** — kept only when it gates bit-faithful to the einsum scan, runs deterministically, *and*
 measures faster — and each config prints the verdict (`[scan FUSE: forward …→… ms (…×) …]`).
 For GDN the configs that lost to the megakernel (large `H`, long scans) move to
 parity-or-better. For KDA the fused scan is kept on every config and wins at launch-bound shapes
-(H16·nc4 ≈ 1.7×), but its per-dim decay is more Vec-heavy than GDN's scalar, so the largest
-configs (e.g. H32·nc8, H64·nc4) still trail the megakernel end-to-end. The whole gated pipeline lives on the IR: einsum cores +
+(H16·nc4 ≈ 1.7×); the fused `TROWEXPANDMUL` keeps the per-dim decay cheap enough that the
+largest configs (H32·nc8, H64·nc4) reach roughly parity with the megakernel end-to-end (the
+in-process fused-vs-einsum scan stage is a steady 1.07–1.30×; the vs-megakernel ratio itself
+is noisy on a shared device). The whole gated pipeline lives on the IR: einsum cores +
 `mul/sub/add/tril/scale` glue + the opaque triangular inverse, with the cumulative-sum / `exp`
 gate arithmetic precomputed host-side into coefficient tensors (the same move the linear
 examples make for decay) — and the host-coefficient decomposition is proven equal to the

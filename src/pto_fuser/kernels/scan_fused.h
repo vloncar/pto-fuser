@@ -135,10 +135,11 @@ AICORE inline void vec_recurrence(__gm__ half* S_gm, __gm__ const float* KV_gm, 
 
 // ── Vec: per-dim recurrence S = diag(dvec)·S + kv (dvec[k] scales S row k) ─────
 // KDA's cross-chunk decay is a per-dimension vector (one rate per K-row of S),
-// unlike GDN's single scalar. Broadcast dvec[D] across the V columns with
-// TROWEXPAND (the kkt_fused row-broadcast idiom) and TMUL, in full f32. To fit the
-// 192 KB UB beside the live sh/sf tiles, the [D,D] broadcast tile reuses kv's slot
-// — kv isn't needed until the final TADD, so it is loaded *after* the decay multiply.
+// unlike GDN's single scalar. The row-scale is a single fused TROWEXPANDMUL
+// (dvec[D] expanded down the V columns and multiplied into S in one instruction),
+// in full f32 — no materialized [D,D] broadcast tile, so sh/sf/kv each keep their
+// own UB slot, kv loads up front, and there is no expand-then-mul WAR edge. This
+// halves the per-dim Vec work vs the old TROWEXPAND+TMUL pair (the large-H lever).
 template <typename P>
 AICORE inline void vec_recurrence_perdim(__gm__ half* S_gm, __gm__ const float* KV_gm,
                                          __gm__ const float* dvec) {
@@ -150,11 +151,14 @@ AICORE inline void vec_recurrence_perdim(__gm__ half* S_gm, __gm__ const float* 
     using GmH    = GlobalTensor<half,  Shape<1,1,1,-1,D>, Stride<1,1,1,D,1>>;
     using GmF    = GlobalTensor<float, Shape<1,1,1,-1,D>, Stride<1,1,1,D,1>>;
     using GmDr   = GlobalTensor<float, Shape<1,1,1,1,-1>, Stride<1,1,1,D,1>>;
-    // resident S(half) -> sf(float)
+    // resident S(half) -> sf(float); kv and the per-dim decay vector loaded up front,
+    // each in its own slot (no slot reuse -> no expand/mul WAR edge to insure).
     TileH sh; TASSIGN(sh, 0);       sh.SetValidRow(D); sh.SetValidCol(D);
     GmH gs(S_gm, Shape<1,1,1,-1,D>(D));
     TLOAD(sh, gs);
-    // per-dim decay vector [D] loaded just past kv's slot (kv not loaded yet)
+    TileF kv; TASSIGN(kv, D*D*2 + D*D*4);  kv.SetValidRow(D); kv.SetValidCol(D);
+    GmF gk(const_cast<__gm__ float*>(KV_gm), Shape<1,1,1,-1,D>(D));
+    TLOAD(kv, gk);
     TileDr dr; TASSIGN(dr, D*D*2 + D*D*4 + D*D*4);  dr.SetValidRow(1); dr.SetValidCol(D);
     GmDr gd(const_cast<__gm__ float*>(dvec), Shape<1,1,1,1,-1>(D));
     TLOAD(dr, gd);
@@ -162,22 +166,11 @@ AICORE inline void vec_recurrence_perdim(__gm__ half* S_gm, __gm__ const float* 
     TileF sf; TASSIGN(sf, D*D*2);   sf.SetValidRow(D); sf.SetValidCol(D);
     TCVT(sf, sh, RoundMode::CAST_RINT);
     pipe_barrier(PIPE_V);
-    // dexp[i,j] = dvec[i] — alias the loaded vector as a [D,1] col, expand into kv's slot
-    TileDc dc;   TASSIGN(dc, D*D*2 + D*D*4 + D*D*4);  dc.SetValidRow(D); dc.SetValidCol(1);
-    TileF dexp;  TASSIGN(dexp, D*D*2 + D*D*4);        dexp.SetValidRow(D); dexp.SetValidCol(D);
-    TROWEXPAND(dexp, dc);
+    // per-dim row-scale in ONE fused op: sf[i,j] *= dvec[i]. dc aliases dr's bytes as a
+    // [D,1] col-major vector (TROWEXPANDMUL's expand operand); no [D,D] broadcast tile.
+    TileDc dc; TASSIGN(dc, D*D*2 + D*D*4 + D*D*4);  dc.SetValidRow(D); dc.SetValidCol(1);
+    TROWEXPANDMUL(sf, sf, dc);
     pipe_barrier(PIPE_V);
-    TMUL(sf, sf, dexp);                        // row-scale S by the per-dim decay
-    pipe_barrier(PIPE_V);
-    // WAR: the kv load (MTE2) overwrites dexp's slot, so the TMUL read of dexp (V)
-    // must complete first — pipe_barrier(PIPE_V) orders V-vs-V only, not V-vs-MTE2.
-    // Missing this edge races at H>=32 (cores loop over units) -> NDET, gate rejects.
-    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2); wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
-    // kv now loaded into its slot (overwrites dexp), then accumulate
-    TileF kv; TASSIGN(kv, D*D*2 + D*D*4);  kv.SetValidRow(D); kv.SetValidCol(D);
-    GmF gk(const_cast<__gm__ float*>(KV_gm), Shape<1,1,1,-1,D>(D));
-    TLOAD(kv, gk);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
     TADD(sf, sf, kv);
     pipe_barrier(PIPE_V);
     TCVT(sh, sf, RoundMode::CAST_RINT);
