@@ -63,6 +63,46 @@ def test_gdn_fused_scan_program_builds():
     assert any(isinstance(n, FusedNode) and n.kernel == "chunk_h_scan" for n in prog.nodes)
 
 
+def test_gdn_fused_kkt_program_builds():
+    """The kkt_gated lowering builds, hosts the FusedNode, and keeps the same
+    inputs/output as the einsum kkt. Default fused_native=True selects the native
+    [M,C,D] kernel (no layout bridge); fused_native=False the mega-bridge kernel."""
+    from pto_fuser import FusedNode, TensorOp
+    from attention._gdn_full import (build_gdn_program, make_gdn_inputs,
+                                     prepare_gdn_bindings)
+    B, H, nc, C, D = 1, 4, 2, 128, 128
+    inp = make_gdn_inputs(B, H, nc, C, D, "cpu")
+    binds = prepare_gdn_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
+    # native (default): no transpose bridge, A produced directly
+    prog = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_kkt=True)
+    assert prog.outputs == ["o"]
+    assert sorted(prog.inputs) == sorted(binds.keys())
+    assert any(isinstance(n, FusedNode) and n.kernel == "kkt_gated_native" for n in prog.nodes)
+    assert not any(isinstance(n, TensorOp) and n.output == "k_kkt" for n in prog.nodes)
+    # mega bridge
+    megap = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_kkt=True,
+                              fused_native=False)
+    assert any(isinstance(n, FusedNode) and n.kernel == "kkt_gated" for n in megap.nodes)
+
+
+def test_gdn_fused_chunk_o_program_builds():
+    """chunk_o's Aqk lowers to the shared gated_qk FusedNode (q@kᵀ + on-chip
+    gate/causal-mask epilogue); same inputs/output as the einsum path. Native default."""
+    from pto_fuser import FusedNode
+    from attention._gdn_full import (build_gdn_program, make_gdn_inputs,
+                                     prepare_gdn_bindings)
+    B, H, nc, C, D = 1, 4, 2, 128, 128
+    inp = make_gdn_inputs(B, H, nc, C, D, "cpu")
+    binds = prepare_gdn_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
+    prog = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_chunk_o=True)
+    assert prog.outputs == ["o"]
+    assert sorted(prog.inputs) == sorted(binds.keys())
+    assert any(isinstance(n, FusedNode) and n.kernel == "gated_qk_native" for n in prog.nodes)
+    megap = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_chunk_o=True,
+                              fused_native=False)
+    assert any(isinstance(n, FusedNode) and n.kernel == "gated_qk" for n in megap.nodes)
+
+
 def test_kda_fused_scan_program_builds():
     """KDA's chunk_h_scan lowering builds with the per-dim-decay FusedNode and keeps
     the same inputs/output as the einsum scan (on-device gate is benchmarks/kda_mega)."""

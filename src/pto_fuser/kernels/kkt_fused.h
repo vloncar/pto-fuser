@@ -77,11 +77,17 @@ AICORE inline void kkt_epilogue_one(__gm__ const float* qk_base, __gm__ const fl
     constexpr unsigned BETF = GROW + HalfC * 4;                // [1,HalfC] f32
     constexpr unsigned BETH = BETF + HalfC * 4;                // [1,HalfC] half
 
+    // Gate base + output offset depend on the operand layout (Step 3):
+    //   mega   : g_t [H,T] head-major, L [T,H,C] heads-inner — the megakernel layout,
+    //            reached only by transposing the Program's [M,C,D] operands (bridge tax).
+    //   native : g_t [M,C], L [M,C,C] — the Program's OWN batch, pid == the M index, so
+    //            the operands feed straight in with no transpose (chunk_o's q@kᵀ then
+    //            needs zero operand shuffles; the win is no longer gated on the bridge).
     unsigned row_off = vid * HalfC;
     unsigned chunk = pid / (unsigned)Hh;
     unsigned head  = pid % (unsigned)Hh;
     int64_t tok0 = (int64_t)chunk * C;
-    int64_t g_base = (int64_t)head * Tt + tok0;
+    int64_t g_base = CFG::native ? (int64_t)pid * C : (int64_t)head * Tt + tok0;
 
     using TileF   = Tile<TileType::Vec, float, HalfC, C, BLayout::RowMajor, -1, -1>;
     using TileGc  = Tile<TileType::Vec, float, 1, C, BLayout::RowMajor, -1, -1>;
@@ -94,7 +100,8 @@ AICORE inline void kkt_epilogue_one(__gm__ const float* qk_base, __gm__ const fl
     using GmGc  = GlobalTensor<float, Shape<1,1,1,1,C>,  Stride<1,1,1,C,1>>;
     using GmGr  = GlobalTensor<float, Shape<1,1,1,1,HalfC>, Stride<1,1,1,HalfC,1>>;
     using GmBh  = GlobalTensor<half,  Shape<1,1,1,1,HalfC>, Stride<1,1,1,HalfC,1>>;
-    using GmL   = GlobalTensor<half,  Shape<1,1,1,-1,C>, Stride<1,1,1,(int64_t)Hh*C,1>>;
+    using GmLm  = GlobalTensor<half,  Shape<1,1,1,-1,C>, Stride<1,1,1,(int64_t)Hh*C,1>>;  // mega L [T,H,C]
+    using GmLn  = GlobalTensor<half,  Shape<1,1,1,-1,C>, Stride<1,1,1,C,1>>;              // native L [M,C,C]
 
     // ── loads ───────────────────────────────────────────────────────────────
     TileF qkf;  TASSIGN(qkf, QKF);   qkf.SetValidRow(HalfC); qkf.SetValidCol(C);
@@ -109,7 +116,7 @@ AICORE inline void kkt_epilogue_one(__gm__ const float* qk_base, __gm__ const fl
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     int64_t l_offp = ((tok0 + row_off) * (int64_t)Hh + head) * C;
-    GmL glp(L + l_offp, Shape<1,1,1,-1,C>(HalfC));
+    GmLm glp(L + l_offp, Shape<1,1,1,-1,C>(HalfC));
     TSTORE(glp, outp);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
@@ -175,9 +182,15 @@ AICORE inline void kkt_epilogue_one(__gm__ const float* qk_base, __gm__ const fl
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 
-    int64_t l_off = ((tok0 + row_off) * (int64_t)Hh + head) * C;
-    GmL gl(L + l_off, Shape<1,1,1,-1,C>(HalfC));
-    TSTORE(gl, outh2);
+    if constexpr (CFG::native) {
+        int64_t l_off = (int64_t)pid * C * C + (int64_t)row_off * C;
+        GmLn gl(L + l_off, Shape<1,1,1,-1,C>(HalfC));
+        TSTORE(gl, outh2);
+    } else {
+        int64_t l_off = ((tok0 + (int64_t)row_off) * (int64_t)Hh + head) * C;
+        GmLm gl(L + l_off, Shape<1,1,1,-1,C>(HalfC));
+        TSTORE(gl, outh2);
+    }
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
 }
@@ -199,15 +212,20 @@ AICORE inline void kkt_epilogue(__gm__ const float* ws_res, __gm__ const float* 
     }
 }
 
+// Two operands a, b: computes a @ bᵀ (NT). kkt passes (k,k) -> k@kᵀ; chunk_o's Aqk
+// passes (q,k) -> q@kᵀ. The gated/masked epilogue is shared: with beta=1 the gate is
+// exp(min(gᵢ-gⱼ,0)) and a causal mask gives chunk_o's Aqk_g exactly; with real beta and
+// a strict-lower mask it gives kkt's A. ONE primitive, two stages — the codegen thesis.
 template <typename CFG>
-__global__ AICORE void kkt_fused_kernel(__gm__ const half* k, __gm__ const float* g_t,
+__global__ AICORE void kkt_fused_kernel(__gm__ const half* a, __gm__ const half* b,
+                                        __gm__ const float* g_t,
                                         __gm__ const half* beta_t, __gm__ const float* mask,
                                         __gm__ float* ws_res, __gm__ half* L,
                                         uint64_t ffts_addr) {
     set_ffts_base_addr(ffts_addr);
     if constexpr (DAV_CUBE) {
         pto_einsum::batched_matmul_inline<half, CFG, false, false, true>(
-            k, k, ws_res, get_block_idx(), get_block_num());
+            a, b, ws_res, get_block_idx(), get_block_num());
     }
     pto_einsum::SyncAll<false>();
     if constexpr (DAV_VEC) {
@@ -223,7 +241,8 @@ __global__ AICORE void kkt_fused_kernel(__gm__ const half* k, __gm__ const float
 // and signals PP_FREE+slot. No global SyncAll — production and consumption stream
 // per tile, so the qk working set is 2 slots/core (L2), never I*C*C in HBM.
 template <typename CFG>
-__global__ AICORE void kkt_fused_kernel_v2(__gm__ const half* k, __gm__ const float* g_t,
+__global__ AICORE void kkt_fused_kernel_v2(__gm__ const half* a, __gm__ const half* b,
+                                           __gm__ const float* g_t,
                                            __gm__ const half* beta_t, __gm__ const float* mask,
                                            __gm__ float* ws_ping, __gm__ half* L,
                                            uint64_t ffts_addr) {
@@ -246,7 +265,7 @@ __global__ AICORE void kkt_fused_kernel_v2(__gm__ const half* k, __gm__ const fl
                 __gm__ float* dst = ws_ping + (int64_t)(cid * 2u + slot) * C * C;
 #ifndef KKT_VEC_NOMATMUL
                 pto_einsum::matmul_one_tile_deep<half, CFG, false, true, true>(
-                    k, k, nullptr, pid, dst);
+                    a, b, nullptr, pid, dst);
 #endif
             }
             ffts_cross_core_sync(PIPE_FIX, pto_einsum::GetffstMsg(0x2, PP_READY + slot));
