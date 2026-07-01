@@ -50,12 +50,29 @@ from pto_fuser import EinsumNode, FusedNode, Program, TensorOp, VecGlueNode
 
 
 # --------------------------------------------------------------------------- #
+#  Per-dim prologue kernel selection (shape gate)
+# --------------------------------------------------------------------------- #
+def select_prologue_kernel(C: int, d_k: int) -> str:
+    """Pick the per-dim prologue lowering by shape.
+
+    Both kernels compute the same ``tril((q⊙P)(k⊙invP)ᵀ)``; they differ in where the
+    scaled operands live. ``qk_prologue_v2`` keeps them in an L2-resident ring (no full
+    ``[M,C,D]`` qd/kinv scratch) and wins where the prescale is bandwidth-heavy — large
+    score/head dims (measured 2.8–5.8× over staged at ``C·d_k ≥ 4096``). At tiny tiles
+    the per-tile single-tile matmul granularity makes V2 lose to V1's batched two-pass,
+    so V1 is the default there. (A double-buffered V2 was measured to add only ~1.1× in
+    the win regime and can't flip the tiny-tile loss — see the fusion notes — so it is
+    not a third option.) ``fusion.decide`` can override this by measurement."""
+    return "qk_prologue_v2" if C * d_k >= 4096 else "qk_prologue"
+
+
+# --------------------------------------------------------------------------- #
 #  The Program
 # --------------------------------------------------------------------------- #
 def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
                                  work=torch.float16, fused_intra: bool = False,
                                  per_dim_gate: bool = False,
-                                 prologue_v2: bool = False) -> Program:
+                                 prologue_v2: "bool | None" = None) -> Program:
     """Chunked linear attention over ``N = B*H`` batched heads, ``nc`` chunks.
 
     Bindings (all batched over ``N``, chunk-major):
@@ -97,8 +114,11 @@ def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
         # [M,C,C] result back to [N,nc,C,C] so the loop slices chunk c as it did staged A.
         if per_dim_gate:
             # per-channel decay -> operand PROLOGUE (q⊙P, k⊙invP) ahead of the matmul.
-            # v2 keeps the scaled operands in an L2 ring (no full [M,C,D] qd/kinv scratch).
-            nodes.append(FusedNode(kernel="qk_prologue_v2" if prologue_v2 else "qk_prologue",
+            # v2 keeps the scaled operands in an L2 ring (no full [M,C,D] qd/kinv scratch);
+            # prologue_v2=None auto-selects V1/V2 by shape (select_prologue_kernel).
+            kernel = (select_prologue_kernel(C, d_k) if prologue_v2 is None
+                      else "qk_prologue_v2" if prologue_v2 else "qk_prologue")
+            nodes.append(FusedNode(kernel=kernel,
                                    inputs=["q", "k", "P", "invP"],
                                    outputs=["A_all"],
                                    params={"nc": nc, "H": N, "C": C, "D": d_k},
@@ -149,6 +169,33 @@ def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
     if fused_intra and not per_dim_gate:
         inputs += ["g_intra", "beta_intra"]   # scalar epilogue needs g; per-dim uses P/invP
     return Program(nodes=nodes, inputs=inputs, outputs=["o"])
+
+
+# --------------------------------------------------------------------------- #
+#  Fusion decision for the intra-score lever
+# --------------------------------------------------------------------------- #
+def decide_fused_intra(N, nc, C, d_k, d_v, gates, dev, *, per_dim_gate, iters=20):
+    """Gate + measure the fused intra-score lever against the staged per-chunk
+    ``einsum + tril``, via :func:`pto_fuser.decide` (needs an NPU).
+
+    Runs the two lowerings of the whole chunked forward on identical inputs — staged vs
+    ``fused_intra`` — captures each, and returns the :class:`FusionDecision`. The scalar
+    family (``per_dim_gate=False``) fuses the gated EPILOGUE (``gated_qk_native_v2``);
+    GLA/KDA (``per_dim_gate=True``) fuse the operand PROLOGUE (``qk_prologue[_v2]``,
+    shape-selected). The fuser keeps the fused kernel only on a gated-green + deterministic
+    + faster win — otherwise the staged-captured lowering stands (the lever ordering)."""
+    from pto_fuser import GraphReplayExecutor, decide
+    q, k, v = make_qkv(N, nc, C, d_k, d_v, dev)
+    binds = prepare_inputs(q, k, v, gates)
+    staged = GraphReplayExecutor().capture(
+        build_chunked_linear_program(N, nc, C, d_k, d_v), binds)
+    fused = GraphReplayExecutor().capture(
+        build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True,
+                                     per_dim_gate=per_dim_gate), binds)
+    kern = select_prologue_kernel(C, d_k) if per_dim_gate else "gated_qk_native_v2"
+    return decide("chunk_intra", kern,
+                  lambda: staged.replay(binds, clone=False),
+                  lambda: fused.replay(binds, clone=False), iters=iters)
 
 
 # --------------------------------------------------------------------------- #
