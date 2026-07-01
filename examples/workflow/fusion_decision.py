@@ -6,7 +6,11 @@ it gates green, is deterministic, AND is faster — otherwise the staged-capture
 lowering stands. Two stages, the two fusion features:
 
   * ``chunk_h_scan`` — resident state (the carried state stays on-chip across chunks);
-  * ``kkt_gated``    — glue absorption (the gated/masked epilogue folded into the store).
+  * ``kkt_gated``    — glue absorption (the gated/masked epilogue folded into the store);
+  * ``chunk_intra``  — the intra-chunk score lever, both halves of the scalar↔per-dim
+    partition: a SCALAR gate (RetNet) fuses the gated EPILOGUE (``gated_qk_native_v2``),
+    a PER-CHANNEL gate (GLA) fuses the operand PROLOGUE (``qk_prologue``). Same decide
+    gate — kept only when gated-green, deterministic, and faster than staged-captured.
 
     python examples/workflow/fusion_decision.py --B 1 --H 4 --nc 8
 """
@@ -23,6 +27,8 @@ from pto_fuser import GraphReplayExecutor, decide  # noqa: E402
 from pto_fuser.forwards import (build_kkt_fused_program, build_scan_fused_program,  # noqa: E402
                                 build_scan_staged_program, kkt_reference,
                                 make_kkt_inputs, make_scan_inputs)
+from attention import gate_gla, gate_retnet  # noqa: E402
+from attention._chunked import decide_fused_intra  # noqa: E402
 
 
 def main():
@@ -53,8 +59,16 @@ def main():
                    lambda: {n: kref[n].clone() for n in kref},
                    lambda: gk.replay(kkt_in, clone=False), tol=2e-2, iters=args.iters)
 
+    # chunk_intra: the shared intra-score lever, both gate classes at their real dims
+    # (C=16, d_k=64). RetNet -> scalar epilogue; GLA -> per-dim prologue.
+    Nq, C, d_k, d_v = B * H, 16, 64, 64
+    d_epi = decide_fused_intra(Nq, nc, C, d_k, d_v, gate_retnet(Nq, nc, C, d_k, H, dev),
+                               dev, per_dim_gate=False, iters=args.iters)
+    d_pro = decide_fused_intra(Nq, nc, C, d_k, d_v, gate_gla(Nq, nc, C, d_k, H, dev),
+                               dev, per_dim_gate=True, iters=args.iters)
+
     print(f"\nfusion decisions  B={B} H={H} nc={nc}")
-    for d in (d_scan, d_kkt):
+    for d in (d_scan, d_kkt, d_epi, d_pro):
         print("  " + str(d))
 
 

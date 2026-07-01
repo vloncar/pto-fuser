@@ -74,6 +74,46 @@ def test_chunked_fused_intra_per_dim_program_builds():
     assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in progv2.nodes)
 
 
+def test_select_prologue_kernel_shape_gate():
+    """The per-dim prologue picks V1 at tiny tiles and V2 where the prescale is
+    bandwidth-heavy (C·d_k >= 4096, the measured win regime); build_*_program
+    auto-selects when prologue_v2 is left None (the default)."""
+    from pto_fuser import FusedNode
+    from attention._chunked import select_prologue_kernel, build_chunked_linear_program
+    assert select_prologue_kernel(16, 64) == "qk_prologue"       # 1024, tiny tile
+    assert select_prologue_kernel(64, 128) == "qk_prologue_v2"   # 8192, win regime
+    # auto-select (prologue_v2=None) flows the shape gate into the Program
+    big = build_chunked_linear_program(8, 4, 64, 128, 128, fused_intra=True, per_dim_gate=True)
+    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in big.nodes)
+
+
+def test_kda_fused_chunk_o_program_builds():
+    """KDA chunk_o's intra score lowers to the per-dim qk_prologue FusedNode (the
+    per-channel analog of GDN's scalar gated_qk epilogue) over qF/kF and the exp(±g)
+    coefficients; same inputs/output. Shape gate picks V2 at C=D=128; prologue_v2=False
+    forces V1; the staged default keeps the chunk_o einsum + tril and no prologue node."""
+    from pto_fuser import FusedNode
+    from attention._kda_full import (build_kda_program, make_kda_inputs,
+                                     prepare_kda_bindings)
+    B, H, nc, C, D = 1, 4, 2, 128, 128
+    inp = make_kda_inputs(B, H, nc, C, D, "cpu")
+    binds = prepare_kda_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
+    prog = build_kda_program(B, H, nc, C, D, D ** -0.5, fused_chunk_o=True)
+    assert prog.outputs == ["o"]
+    assert sorted(prog.inputs) == sorted(binds.keys())
+    pro = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")]
+    assert len(pro) == 1 and pro[0].outputs == ["Aqk_c"]
+    assert pro[0].inputs == ["qF", "kF", "coef_ag", "coef_bg"]
+    assert pro[0].kernel == "qk_prologue_v2"           # C·D = 16384 -> win regime
+    # forced V1
+    v1 = build_kda_program(B, H, nc, C, D, D ** -0.5, fused_chunk_o=True, prologue_v2=False)
+    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue" for n in v1.nodes)
+    # staged default: no prologue FusedNode
+    staged = build_kda_program(B, H, nc, C, D, D ** -0.5)
+    assert not any(isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")
+                   for n in staged.nodes)
+
+
 def test_full_gdn_kda_programs_build():
     """The end-to-end gated forwards build + their host-coefficient bindings match the
     Program inputs (off-NPU; the on-device numeric gate is benchmarks/{gdn,kda}_mega)."""
