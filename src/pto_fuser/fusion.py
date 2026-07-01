@@ -1,8 +1,8 @@
-"""Fusion decision procedure — the staged-vs-fused decision (design §4, §6, §8).
+"""Fusion decision procedure — the staged-vs-fused decision (see DESIGN.md).
 
 Graph capture is the default backend: a staged chain replayed as one dispatch,
 perf-neutral-to-winning everywhere. Lever 6 (a single hand-fused kernel) is the
-*last resort* — design §4 keeps it "only where launch-bound small-`T` justifies it
+*last resort* — the design keeps it "only where launch-bound small-`T` justifies it
 and graph capture is insufficient." What graph capture does **not** remove is the
 HBM round-trip of intermediates between stages: the resident state ``S`` of the
 chunk scan, or the qk matrix of kkt. A fused kernel keeps those on-chip. Whether
@@ -12,7 +12,7 @@ deliverable is a measured decision, not a blanket "fuse everything."
 `decide` runs both lowerings of one stage on identical inputs and returns a
 `FusionDecision`:
 
-  * **frob gate** — the fused output must match the staged output (design §6: a
+  * **frob gate** — the fused output must match the staged output (the design: a
     broken/garbage fused pipeline fails here; ungated "wins" were the historical trap).
   * **determinism gate** — the fused kernel run twice must be bit-identical (design
     §6: mandatory on any fused/mega/scan lowering — this is what caught the mega

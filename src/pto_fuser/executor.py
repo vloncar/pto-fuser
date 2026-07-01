@@ -4,7 +4,7 @@ Runs a `Program` node-by-node over a name->tensor environment. Each `EinsumNode`
 dispatches to its own library `.so` (persistent-workspace setup/exec/teardown,
 handled inside `pto_einsum`); stages share GM tensors through the environment.
 This is the correctness reference every other backend (graph-replay, fused-node)
-is gated against (docs/FUSER_DESIGN.md §5–6).
+is gated against (docs/DESIGN.md §5–6).
 
 The executor honors only the **default** einsum lowering (NN, no fused store, no
 folded glue). Planner annotations on `EinsumNode` are intentionally ignored here;

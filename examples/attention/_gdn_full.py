@@ -28,8 +28,7 @@ from __future__ import annotations
 
 import torch
 
-from pto_fuser import (EinsumNode, FusedNode, OpaqueNode, Program, TensorOp,
-                       VecGlueNode)
+from pto_fuser import EinsumNode, OpaqueNode, Program, TensorOp, VecGlueNode
 
 
 # --------------------------------------------------------------------------- #
@@ -127,12 +126,11 @@ def prepare_gdn_bindings(q, k, v, beta, g_in, work=torch.float16) -> dict:
     coef_vcs = torch.exp(gl.unsqueeze(-1) - gi)               # [B,H,nc,C,1] exp(gl-g)
     coef_S = torch.exp(gl).unsqueeze(-1)                       # [B,H,nc,1,1] exp(gl)
 
-    # scalar gate operands for the kkt_gated FusedNode (token-major, heads inner —
-    # the kernel's mega [1,T,H] layout; it applies exp(min(gᵢ-gⱼ+log βᵢ,0))·mask
-    # on-chip). Always emitted (cheap, [B,T,H]); only consumed when fused_kkt=True.
-    tmh = lambda t, dt: t.permute(0, 2, 3, 1).reshape(B, nc * C, H).to(dt).contiguous()
     # native [M,C] gate operands (heads outer, the Program's own batch) for the
-    # *_native FusedNodes — no transpose, just g_sum/β reshaped to match flat(kF).
+    # scalar-gated glue-absorption FusedNodes (kkt_gated_native / gated_qk_native) —
+    # no transpose, just g_sum/β reshaped to match flat(kF). Consumed only after the
+    # absorb-gated-kkt / absorb-gated-chunk-o transforms fire; declared as Program
+    # inputs so those rewrites validate.
     nat = lambda t, dt: t.reshape(M, C).to(dt).contiguous()
 
     return {
@@ -141,8 +139,6 @@ def prepare_gdn_bindings(q, k, v, beta, g_in, work=torch.float16) -> dict:
         "coef_vb": flat(coef_vb, C, 1), "coef_qg": flat(coef_qg, C, 1),
         "coef_o": flat(coef_o, C, C),
         "coef_vcs": nflat(coef_vcs, C, 1), "coef_S": nflat(coef_S, 1, 1),
-        "g_scalar": tmh(g_sum, torch.float32), "beta_scalar": tmh(bet, work),
-        "beta_ones": torch.ones(B, nc * C, H, device=q.device, dtype=work),
         "g_native": nat(g_sum, torch.float32), "beta_native": nat(bet, work),
         "beta_native_ones": torch.ones(M, C, device=q.device, dtype=work),
     }
@@ -151,55 +147,23 @@ def prepare_gdn_bindings(q, k, v, beta, g_in, work=torch.float16) -> dict:
 # --------------------------------------------------------------------------- #
 #  the Program
 # --------------------------------------------------------------------------- #
-def build_gdn_program(B, H, nc, C, D, scale, work=torch.float16,
-                      fused_scan=False, fused_kkt=False, fused_chunk_o=False,
-                      fused_native=True, fused_v2=False) -> Program:
-    """The full gated GDN forward (output ``o`` [B,H,nc,C,D]). Inputs are the
-    flattened operands + gate coefficients from :func:`prepare_gdn_bindings`.
+def build_gdn_program(B, H, nc, C, D, scale, work=torch.float16) -> Program:
+    """The full gated GDN forward as the **canonical** (all-staged) `Program` — output
+    ``o`` [B,H,nc,C,D], inputs the flattened operands + gate coefficients from
+    :func:`prepare_gdn_bindings`.
 
-    ``fused_kkt`` swaps the kkt stage (``k·kᵀ`` einsum + ``coefA`` mul + tril) for the
-    ``kkt_gated`` FusedNode: the einsum tile-matmul core with the decay/beta/causal-mask
-    epilogue applied *on-chip*, so the ``qk`` intermediate never round-trips HBM (the
-    glue-absorption lever — the captured forward at large H is glue-bound). The kernel
-    carries one sequence in mega ``[1,T,H,D]`` layout, so the lowering bridges the
-    Program's ``[M,C,D]`` (heads outer) ↔ ``[nc,C,H,D]`` (token-major) with one transpose
-    each side and feeds the scalar gate operands ``g_scalar``/``beta_scalar`` (B=1 only).
-    Measured gated win: captured forward 1.07–1.11× across large-H configs (frob-equal to
-    the einsum kkt, deterministic), additive on top of ``fused_scan``.
+    This is the always-valid Phase-A lowering: every stage its own einsum / glue node,
+    the cross-chunk scan unrolled over chunks (the state ``S`` round-tripping HBM each
+    chunk), no fused nodes. It is the correctness reference the verifier gates against
+    and the starting point the transforms rewrite. The optimized lowerings —
+    resident-state scan (`chunk_h_scan`), scalar-gated glue absorption
+    (`kkt_gated_native`, `gated_qk_native`), and the read-mode / fused-store selection —
+    are **transforms** applied by ``pto_fuser.compile_program`` (policy + cost model +
+    verifier), not build flags here. See ``pto_fuser.transforms.gdn`` for the rewrites
+    that recognize the regions this builder emits.
 
-    ``fused_chunk_o`` lowers chunk_o's ``Aqk = (q@kᵀ)·coef_o`` through the *same* gated_qk
-    kernel (a@bᵀ + on-chip gate/mask epilogue) with ``a=q, b=k, β=1, causal`` — one
-    primitive serving two stages.
-
-    ``fused_native`` (default **True**, Step 3) selects the native-``[M,C,D]`` variants
-    (``kkt_gated_native`` / ``gated_qk_native``): the kernel reads the Program's own batch
-    layout and writes ``A``/``Aqk_c`` as ``[M,C,C]`` directly, with **no transpose bridge**.
-    This is what makes glue-absorption general — the mega path (``fused_native=False``) bolts
-    the megakernel's ``[1,T,H,D]`` layout in, which costs one operand transpose per distinct
-    input (B=1 only): for kkt's ``k@kᵀ`` (one shared operand) the bridged win still measured
-    1.07–1.11× captured, but for chunk_o's ``q@kᵀ`` (two operands) the two-transpose tax
-    exceeded its smaller glue → a *net loss* (~0.88–0.92×). The native path removes that tax,
-    so chunk_o pays zero operand shuffles and both stages fuse profitably.
-
-    ``fused_v2`` (native only) selects the per-tile FFTS-interleave kernel, which keeps the
-    ``qk`` tile L2-resident instead of round-tripping the whole ``[M,C,C]`` through HBM (V1's
-    two-pass). Measured: kkt 1.18–1.20×, chunk_o to parity (off the loss), ``+both`` 1.18–1.19×
-    captured — native layout (no bridge) + V2 (no round-trip) is the full glue-absorption win.
-
-    The gated epilogue is mechanism-agnostic across the *scalar-gated* family: vanilla LA,
-    RetNet, Mamba-2 and GDN all share ``(q@kᵀ)·exp(gᵢ-gⱼ)·mask`` and differ only in the host
-    ``g`` (and ``β`` for GDN). Per-channel gates (GLA, KDA) keep the decay *inside* the
-    contraction → those need an operand prologue, not this epilogue (a parallel lever).
-
-    ``fused_scan`` swaps the unrolled einsum/glue cross-chunk scan (which round-trips
-    the recurrent state ``S`` through HBM every chunk) for the ``chunk_h_scan``
-    FusedNode, which keeps ``S`` resident on-chip across chunks. GDN's gated recurrence
-    ``S = exp(gₗ)·S + kᵀ·((U−W·S)·exp(gₗ−g))`` maps onto the kernel's
-    ``S = decay·S + kᵀ·(u−w·S)`` by feeding ``w=W``, ``u=U``, ``k = kF·exp(gₗ−g)`` (the
-    per-token factor absorbed into k), ``decay = exp(gₗ)``; the kernel emits the states
-    ``h_out`` but not ``v_new``, so ``v_new = U − W·h_out`` is recomputed as one parallel
-    batched matmul (no sequential S round-trip). Identical ``o`` either way — this is the
-    lowering the fusion-decide gate selects on a measured win."""
+    All gating is host-precomputed coefficient tensors multiplied into the operands /
+    scores by ``mul`` glue (proven bit-equal to the fp32 ``gdn_reference``)."""
     M, N = B * H * nc, B * H
     nodes: list = []
 
@@ -217,47 +181,16 @@ def build_gdn_program(B, H, nc, C, D, scale, work=torch.float16,
         ins = [] if ins is None else (ins if isinstance(ins, list) else [ins])
         nodes.append(TensorOp(op, ins, out, params=p)); return out
 
+    # g_native/beta_native/beta_native_ones are declared here (consumed only after the
+    # scalar-gated glue-absorption transforms fire) so those rewrites validate.
     inputs = ["qF", "kF", "vF", "coefA", "coef_kb", "coef_vb",
               "coef_qg", "coef_o", "coef_vcs", "coef_S",
-              "g_scalar", "beta_scalar", "beta_ones",
               "g_native", "beta_native", "beta_native_ones"]
 
-    if fused_kkt and fused_native:
-        # -- kkt via the NATIVE FusedNode: no layout bridge (Step 3) ------------- #
-        # kkt_gated_native reads kF in the Program's own [M,C,D] batch and writes A
-        # directly as [M,C,C] — the matmul-core + on-chip gated/masked epilogue with
-        # zero transpose either side (the bridge that taxed the mega path is gone).
-        # fused_v2 additionally drops the kernel's own qk HBM round-trip (per-tile
-        # FFTS interleave) — the last residual vs the megakernel.
-        nodes.append(FusedNode(kernel="kkt_gated_native_v2" if fused_v2 else "kkt_gated_native",
-                               inputs=["kF", "g_native", "beta_native"],
-                               outputs=["A"], params={"nc": nc, "H": H},
-                               subsumes=["kkt einsum + coefA mul + tril (qk never in HBM)"]))
-    elif fused_kkt:
-        # -- kkt via FusedNode: matmul-core + on-chip gated+masked epilogue ----- #
-        # The kernel (kkt_gated) reads the keys in mega [1,T,H,D] (token-major,
-        # heads inner) and writes the gated strict-lower A row by row, so the qk
-        # intermediate never lands in HBM (the glue-absorption lever). The Program
-        # is [M,C,D] (M=B*H*nc, heads outer), so bridge in/out with one transpose
-        # each: [H,nc,C,D]->[nc,C,H,D] in, [nc,C,H,C]->[H,nc,C,C] out (B=1 only —
-        # the kernel carries a single sequence, like the megakernel benchmark).
-        if B != 1:
-            raise ValueError("fused_kkt (mega) requires B=1 (kernel carries one sequence)")
-        T("kF_hncd", "reshape", "kF", shape=[H, nc, C, D])
-        T("k_kkt5", "permute", "kF_hncd", dims=(1, 2, 0, 3))   # -> [nc,C,H,D]
-        T("k_kkt", "reshape", "k_kkt5", shape=[1, nc * C, H, D])
-        nodes.append(FusedNode(kernel="kkt_gated",
-                               inputs=["k_kkt", "g_scalar", "beta_scalar"],
-                               outputs=["L_kkt"], params={"nc": nc, "H": H},
-                               subsumes=["kkt einsum + coefA mul + tril (qk never in HBM)"]))
-        T("L_nchc", "reshape", "L_kkt", shape=[nc, C, H, C])
-        T("L_hncc", "permute", "L_nchc", dims=(2, 0, 1, 3))    # -> [H,nc,C,C]
-        T("A", "reshape", "L_hncc", shape=[M, C, C])
-    else:
-        # -- kkt: A = tril( (k·kᵀ) ⊙ coefA , -1 ) --------------------------- #
-        E("Araw", "nid,njd->nij", "kF", "kF")
-        G("Ag", "mul", ["Araw", "coefA"])
-        G("A_t", "tril", "Ag", diagonal=-1); T("A", "contiguous", "A_t")
+    # -- kkt: A = tril( (k·kᵀ) ⊙ coefA , -1 ) ------------------------------- #
+    E("Araw", "nid,njd->nij", "kF", "kF")
+    G("Ag", "mul", ["Araw", "coefA"])
+    G("A_t", "tril", "Ag", diagonal=-1); T("A", "contiguous", "A_t")
 
     # -- solve_tril: opaque (I + A)⁻¹ --------------------------------------- #
     Op("T_raw", "tri_inv_rec_unroll", "A"); T("Tm", "cast", "T_raw", dtype=work)
@@ -269,74 +202,31 @@ def build_gdn_program(B, H, nc, C, D, scale, work=torch.float16,
     T("Ub", "reshape", "U_m", shape=[N, nc, C, D])
     T("kb5", "reshape", "kF", shape=[N, nc, C, D])
 
-    if fused_scan:
-        # -- chunk_h scan via FusedNode (S resident on-chip, no per-chunk HBM RT) -- #
-        G("k_vcs", "mul", ["kb5", "coef_vcs"])                  # kF·exp(gl-g) [N,nc,C,D]
-        for nm, src in (("sw", "Wb"), ("su", "Ub"), ("sk", "k_vcs")):
-            T(f"{nm}5", "reshape", src, shape=[B, H, nc, C, D])
-            T(nm, "permute", f"{nm}5", dims=(0, 2, 3, 1, 4))   # -> kernel [B,nc,C,H,D]
-        T("sdecay", "reshape", "coef_S", shape=[B, H, nc])     # exp(gl) per (b,h,c)
-        nodes.append(FusedNode(kernel="chunk_h_scan", inputs=["sw", "su", "sk", "sdecay"],
-                               outputs=["h_out_k", "final_k"],
-                               params={"B": B, "H": H, "nc": nc},
-                               subsumes=["nc per-chunk WS/kv matmul pairs + residual glue"]))
-        T("h_bhn", "permute", "h_out_k", dims=(0, 2, 1, 3, 4))  # [B,nc,H,D,D]->[B,H,nc,D,D]
-        T("h_flat", "reshape", "h_bhn", shape=[M, D, D])
-        E("WS_all", "nid,nde->nie", "W_m", "h_flat")           # parallel W·S (one dispatch)
-        G("vn_flat", "sub", ["U_m", "WS_all"])                 # v_new = U - W·S  [M,C,D]
-    else:
-        # -- chunk_h scan over chunks (resident S in HBM, unrolled) ------------- #
-        T("S0", "zeros", "Wb", shape=[N, D, D], dtype=work)
-        h_list, vn_list, S = [], [], "S0"
-        for c in range(nc):
-            h_list.append(S)
-            T(f"Wc{c}_s", "slice", "Wb", axis=1, index=c); T(f"Wc{c}", "contiguous", f"Wc{c}_s")
-            E(f"WS{c}", "nid,nde->nie", f"Wc{c}", S)
-            T(f"Uc{c}", "slice", "Ub", axis=1, index=c)
-            G(f"vn{c}", "sub", [f"Uc{c}", f"WS{c}"])                       # vc = U - W·S
-            vn_list.append(f"vn{c}")
-            T(f"vcs{c}", "slice", "coef_vcs", axis=1, index=c)
-            G(f"vn2{c}", "mul", [f"vn{c}", f"vcs{c}"])                     # vc·exp(gl-g)
-            T(f"kc{c}_s", "slice", "kb5", axis=1, index=c); T(f"kc{c}", "contiguous", f"kc{c}_s")
-            E(f"dS{c}", "nid,nie->nde", f"kc{c}", f"vn2{c}")              # kᵀ·(vc·…)
-            T(f"sc{c}", "slice", "coef_S", axis=1, index=c)
-            G(f"Sd{c}", "mul", [S, f"sc{c}"])                             # exp(gl)·S
-            S = G(f"S{c + 1}", "add", [f"Sd{c}", f"dS{c}"])
-        T("h_bh", "stack", h_list, dim=1); T("h_flat", "reshape", "h_bh", shape=[M, D, D])
-        T("vn_bh", "stack", vn_list, dim=1); T("vn_flat", "reshape", "vn_bh", shape=[M, C, D])
+    # -- chunk_h scan over chunks (resident S in HBM, unrolled) ------------- #
+    T("S0", "zeros", "Wb", shape=[N, D, D], dtype=work)
+    h_list, vn_list, S = [], [], "S0"
+    for c in range(nc):
+        h_list.append(S)
+        T(f"Wc{c}_s", "slice", "Wb", axis=1, index=c); T(f"Wc{c}", "contiguous", f"Wc{c}_s")
+        E(f"WS{c}", "nid,nde->nie", f"Wc{c}", S)
+        T(f"Uc{c}", "slice", "Ub", axis=1, index=c)
+        G(f"vn{c}", "sub", [f"Uc{c}", f"WS{c}"])                       # vc = U - W·S
+        vn_list.append(f"vn{c}")
+        T(f"vcs{c}", "slice", "coef_vcs", axis=1, index=c)
+        G(f"vn2{c}", "mul", [f"vn{c}", f"vcs{c}"])                     # vc·exp(gl-g)
+        T(f"kc{c}_s", "slice", "kb5", axis=1, index=c); T(f"kc{c}", "contiguous", f"kc{c}_s")
+        E(f"dS{c}", "nid,nie->nde", f"kc{c}", f"vn2{c}")              # kᵀ·(vc·…)
+        T(f"sc{c}", "slice", "coef_S", axis=1, index=c)
+        G(f"Sd{c}", "mul", [S, f"sc{c}"])                             # exp(gl)·S
+        S = G(f"S{c + 1}", "add", [f"Sd{c}", f"dS{c}"])
+    T("h_bh", "stack", h_list, dim=1); T("h_flat", "reshape", "h_bh", shape=[M, D, D])
+    T("vn_bh", "stack", vn_list, dim=1); T("vn_flat", "reshape", "vn_bh", shape=[M, C, D])
 
     # -- chunk_o: o = (q·h)·coef_qg + tril(q·kᵀ ⊙ coef_o)·v_new, scaled ----- #
     E("o_inter_m", "nid,nde->nie", "qF", "h_flat")
     G("o_inter", "mul", ["o_inter_m", "coef_qg"])
-    if fused_chunk_o and fused_native:
-        # Aqk via the NATIVE gated_qk (Step 3): q,k both fed straight from the
-        # Program's [M,C,D] batch — the two-operand transpose tax that made the mega
-        # chunk_o a net loss is gone. Output Aqk_c is [M,C,C] directly.
-        nodes.append(FusedNode(kernel="gated_qk_native_v2" if fused_v2 else "gated_qk_native",
-                               inputs=["qF", "kF", "g_native", "beta_native_ones"],
-                               outputs=["Aqk_c"], params={"nc": nc, "H": H, "causal": True},
-                               subsumes=["chunk_o Aqk einsum + coef_o mul + contiguous"]))
-    elif fused_chunk_o:
-        # Aqk via the same gated_qk FusedNode as kkt — a@bᵀ + on-chip gate/mask
-        # epilogue — but a=q, b=k, beta=1 (no β), causal mask. The qk intermediate
-        # and the coef_o [M,C,C] multiply never land in HBM. Same [M,C,D]↔[nc,C,H,D]
-        # bridge as fused_kkt (B=1).
-        if B != 1:
-            raise ValueError("fused_chunk_o (mega) requires B=1 (kernel carries one sequence)")
-        for nm, src in (("q_kkt", "qF"), ("k_kkt_o", "kF")):
-            T(f"{nm}_hncd", "reshape", src, shape=[H, nc, C, D])
-            T(f"{nm}_p", "permute", f"{nm}_hncd", dims=(1, 2, 0, 3))   # -> [nc,C,H,D]
-            T(nm, "reshape", f"{nm}_p", shape=[1, nc * C, H, D])
-        nodes.append(FusedNode(kernel="gated_qk",
-                               inputs=["q_kkt", "k_kkt_o", "g_scalar", "beta_ones"],
-                               outputs=["Aqk_L"], params={"nc": nc, "H": H, "causal": True},
-                               subsumes=["chunk_o Aqk einsum + coef_o mul + contiguous"]))
-        T("AqkL_nchc", "reshape", "Aqk_L", shape=[nc, C, H, C])
-        T("AqkL_hncc", "permute", "AqkL_nchc", dims=(2, 0, 1, 3))      # -> [H,nc,C,C]
-        T("Aqk_c", "reshape", "AqkL_hncc", shape=[M, C, C])
-    else:
-        E("Aqk", "nid,njd->nij", "qF", "kF")
-        G("Aqk_g", "mul", ["Aqk", "coef_o"]); T("Aqk_c", "contiguous", "Aqk_g")
+    E("Aqk", "nid,njd->nij", "qF", "kF")
+    G("Aqk_g", "mul", ["Aqk", "coef_o"]); T("Aqk_c", "contiguous", "Aqk_g")
     E("o_intra", "nij,nje->nie", "Aqk_c", "vn_flat")
     G("o_sum", "add", ["o_inter", "o_intra"], out_dtype=torch.float32)
     G("o_s", "scale", "o_sum", scalar=scale, out_dtype=torch.float32)

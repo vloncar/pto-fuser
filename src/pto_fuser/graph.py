@@ -1,6 +1,6 @@
 """Graph-replay backend — the dispatch-elimination feature.
 
-`docs/FUSER_DESIGN.md` §4 (graph capture) / §5 "Graph-replay": an NPUGraph captures the
+`docs/DESIGN.md` §4 (graph capture) / §5 "Graph-replay": an NPUGraph captures the
 staged chain's per-stage ctypes launches and replays them as a *single* dispatch.
 This collapses N per-stage host launches into one — the win that lets a staged
 pipeline *beat* a monolithic mega kernel in the launch-bound small-`T` regime
@@ -27,7 +27,7 @@ Usage::
 
 `replay` copies the new operands into the static input buffers the graph was
 captured over, replays, and returns the (stable, pool-resident) output tensors.
-Shapes are fixed at capture time (design §9: static-shape assumption); a new shape
+Shapes are fixed at capture time (the design: static-shape assumption); a new shape
 needs a new capture.
 """
 from __future__ import annotations

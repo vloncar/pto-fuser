@@ -3,7 +3,7 @@
 A second reference forward (GDN or KDA) confirms the planner generalizes. GDN shares the kkt/wy/chunk_h/chunk_o stages with
 DeltaNet but in a **different equation family** — the head axis ``h`` is a
 non-innermost batch axis, which is exactly what drives the library's NT /
-NN-strided / TN direct reads (§2.11–2.13). The full GDN forward additionally needs
+NN-strided / TN direct reads (the read/store modes–2.13). The full GDN forward additionally needs
 the gating cumsum, GQA repeat, and the chunk_h cross-chunk recurrence with resident
 state (the resident-state feature); those are glue around the same four contractions,
 so for the planner — whose job is the read-mode / fused-store decision per contraction

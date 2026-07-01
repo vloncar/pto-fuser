@@ -59,7 +59,6 @@ FAMILY = type("Family", (), dict(
         inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])),
     mega_runner=staticmethod(_mega_runner),
     to_mega_golden=staticmethod(_to_mega_golden),
-    fused_scan=True,        # offer the chunk_h_scan resident-state lowering (per-dim decay, gated by decide)
 ))()
 
 

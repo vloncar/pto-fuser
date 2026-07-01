@@ -1,7 +1,7 @@
 """pto-fuser IR — the three compute node types + host plumbing.
 
 A program is an ordered list of steps over named tensors (an environment that
-maps name -> torch.Tensor). The design (docs/FUSER_DESIGN.md §3) fixes **three
+maps name -> torch.Tensor). The design (docs/DESIGN.md §3) fixes **three
 compute node types**, proved sufficient by the chunk-attention taxonomy:
 
   * ``EinsumNode``   — one library contraction (the core unit).
@@ -55,17 +55,17 @@ class EinsumNode(Node):
     output: str
     out_dtype: Optional[Any] = None     # cast the (fp32) library result; None = native
     # --- planner annotations (set + gated by the Planner; see planner.py) ---
-    # The library auto-selects the read mode (NT/NN-strided/TN, §2.11–2.13) and the
-    # operand-swap-to-fused-store (§2.9) from the equation+layout; it exposes the
+    # The library auto-selects the read mode (NT/NN-strided/TN, the read/store modes–2.13) and the
+    # operand-swap-to-fused-store (the read/store modes) from the equation+layout; it exposes the
     # documented toggles EINSUM_DISABLE_NT / EINSUM_DISABLE_OPERAND_SWAP. These two
-    # fields *select among* those (design §2), they do not re-implement them:
+    # fields *select among* those (see DESIGN.md), they do not re-implement them:
     #   read_mode = "auto" -> let the library pick the direct-read mode (default);
     #               "NN"   -> force the always-valid Phase-A NN lowering.
     #   fuse_out  = True   -> permit the operand-swap that exposes the fused store
     #               (default); False -> forbid the swap. The plain fused store still
     #               auto-fires when free1 is already innermost regardless of this.
     read_mode: str = "auto"             # auto | NN   (NT/NN_strided/TN chosen by library)
-    fuse_out: bool = True               # §2.9 / operand-swap permitted
+    fuse_out: bool = True               # the read/store modes / operand-swap permitted
     epilogue: Optional[list] = None     # glue absorbed into the store (planner detects; fused-node backend emits)
     prologue: Optional[list] = None     # per-operand scaling folded into the load
 
@@ -103,7 +103,7 @@ class VecGlueNode(Node):
 @dataclass
 class FusedNode(Node):
     """A sub-chain collapsed into ONE hand-fused kernel, hosted by key from the
-    fused-kernel registry (``fused.py``). This is the lever-5/6 backend (design §4):
+    fused-kernel registry (``fused.py``). This is the fused-node backend (see DESIGN.md):
     a resident-state recurrence (``chunk_h_scan``) or a matmul-core + on-chip
     epilogue (``kkt_gated``) that subsumes several staged stages into a single
     dispatch, keeping intermediates (the carried state, the gated qk) on-chip
@@ -111,14 +111,14 @@ class FusedNode(Node):
 
     Unlike the staged lowering it replaces, a fused kernel may produce **several**
     outputs (the scan emits both per-chunk readouts and the final state), so this is
-    the one node type with an ``outputs`` *list*. It is kept only when the decision
-    procedure (``fusion.py``) gates it bit-faithful + deterministic vs the staged
-    lowering AND measures it faster — design §4 ("monolithic fusion: last resort, narrow regime
-    only"), §6 (determinism gate mandatory on any fused lowering).
+    the one node type with an ``outputs`` *list*. It is kept only when the verifier
+    (``fusion.py`` / ``compile.py``) gates it bit-faithful + deterministic vs the
+    canonical lowering AND measures it faster (the determinism gate is mandatory on any
+    fused lowering).
 
-    The hosted kernels are the proven prototype artifacts (``prototypes/kkt_fused``,
-    ``prototypes/chunk_h_scan``), built as their own ``.so`` and sharing GM with the
-    surrounding stages — which design §9 records as the form that *works today*. The
+    The hosted kernels live in ``kernels/`` (``kkt_fused``, ``chunk_h_scan``), built as
+    their own ``.so`` and sharing GM with the surrounding stages — the form that
+    *works today*. The
     further step of inlining an opaque AICORE device-fn into one ``.so`` with the
     library matmul core (the tri_inv case) stays unproven research; it is not used
     here. ``inputs`` carry the logical operand names; the registry lowering owns the

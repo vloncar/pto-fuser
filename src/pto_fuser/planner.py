@@ -2,13 +2,13 @@
 
 The read-mode (NT/NN-strided/TN) and operand-swap → fused-store features are realized **inside the soft-frozen library**: it auto-selects them from
 the equation+layout and exposes the documented toggles ``EINSUM_DISABLE_NT`` /
-``EINSUM_DISABLE_OPERAND_SWAP``. Per design §2 the fuser *selects among* these
+``EINSUM_DISABLE_OPERAND_SWAP``. Per the design the fuser *selects among* these
 library capabilities; it does not re-implement them. So the planner, for each
 distinct ``EinsumNode`` contraction:
 
   1. measures the library's optimized lowering against the always-valid Phase-A
      NN baseline on that node's real operands;
-  2. **frob-gates** the two equivalent (design §6 — a broken lowering that produced
+  2. **frob-gates** the two equivalent (the design — a broken lowering that produced
      zero/garbage would fail here);
   3. keeps the optimization only when gated-green **and** faster than the baseline
      ("kept only where gated-green and faster than default").
@@ -22,7 +22,7 @@ builds.
 Glue absorption is a *detector* here (`absorption_candidates`): it finds
 ``VecGlueNode`` → ``EinsumNode`` adjacencies whose intermediate round-trips HBM and
 could be folded into the contraction's epilogue/prologue. The actual on-chip fold
-is the fused-node backend (design §5) — the one place the fuser emits new device
+is the fused-node backend (see DESIGN.md) — the one place the fuser emits new device
 code — and is realized by the fused-node backend, with the ``kkt_fused`` kernel as its evidence.
 """
 from __future__ import annotations

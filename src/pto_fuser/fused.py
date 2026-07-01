@@ -1,4 +1,4 @@
-"""Fused-kernel registry — the lever-5/6 backend (design §4, §5).
+"""Fused-kernel registry — the fused-node backend (see DESIGN.md).
 
 A ``FusedNode`` names a hand-fused kernel that subsumes a staged sub-chain into one
 dispatch, keeping intermediates on-chip. The registry maps that name to a recipe
@@ -9,7 +9,7 @@ runner is reused across calls. Operand layout/dtype adapters and output allocati
 live in the registered lowering, exactly as the opaque registry does for tri_inv.
 
 Two seed entries, both proven prototypes built as their own ``.so`` sharing GM with
-the surrounding stages (design §9: *this* form works today; single-``.so`` opaque
+the surrounding stages (the design: *this* form works today; single-``.so`` opaque
 inline is the unproven part and is not used here):
 
   * ``chunk_h_scan`` — the resident-state recurrence. State ``S`` stays
@@ -226,7 +226,7 @@ def _gated_qk_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
                          causal=params.get("causal", True))
 
 
-# -- native [M,C,D] variants (Step 3): operands feed straight in, no layout bridge -- #
+# -- native [M,C,D] variants: operands feed straight in, no layout bridge -- #
 def _gated_qk_run_native(lib, ws, a, b, g_native, beta_native, M, C, D, causal,
                          v2=False) -> List[torch.Tensor]:
     """Same gated a@bᵀ epilogue, but the kernel reads the Program's NATIVE [M,C,D]
@@ -375,7 +375,7 @@ def default_fused_registry() -> FusedKernelRegistry:
             out_names=["L"], out_dtype=torch.float16,
             notes="a@bᵀ matmul-core + on-chip gated+masked epilogue; same .so as "
                   "kkt_gated; chunk_o Aqk = (q,k,beta=1,causal); C=D=128; a,b [1,T,H,D]")))
-    # Step 3: native-[M,C,D] variants — same kernel, KKT_NATIVE config + epilogue path,
+    # native-[M,C,D] variants — same kernel, KKT_NATIVE config + epilogue path,
     # operands/g/β/L in the Program's own batch layout so there is no transpose bridge.
     reg.register("kkt_gated_native", _Recipe(
         src_dir=_KERNELS, src_file="kkt_fused_lib.cpp",

@@ -1,4 +1,4 @@
-"""Head-to-head stages for the staged-vs-fused decision (design §7).
+"""Head-to-head stages for the staged-vs-fused decision (see DESIGN.md).
 
 Each stage is provided in **two** equivalent lowerings over identical inputs, so
 `fusion.decide` can gate (frob ≡ + determinism) and time them against each other:

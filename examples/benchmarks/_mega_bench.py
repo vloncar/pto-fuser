@@ -30,7 +30,8 @@ import torch
 
 import common
 from common import Measurement, format_table
-from pto_fuser import GraphReplayExecutor, StagedExecutor, decide, frob_rel
+from pto_fuser import (Features, GraphReplayExecutor, StagedExecutor,
+                       compile_program, frob_rel)
 
 
 def _lowering(prog, binds, ref):
@@ -51,28 +52,15 @@ def _measure_config(fam, dev, H, nc, iters, mega_name):
     ref = fam.reference(inp, scale)                       # [B,H,nc,C,D] fp32 golden
     binds = fam.prepare(inp)
 
-    # fuser, default lowering: graph-captured forward (einsum/glue scan)
-    gr, f_fuser, faithful = _lowering(fam.build(B, H, nc, C, D, scale), binds, ref)
-    runner = gr
-
-    # optional fused-scan lowering — kept only on a gated, deterministic, measured win
-    # (chunk_h_scan keeps the recurrent state S resident; the einsum scan round-trips it)
-    scan_rec, scan_note = None, ""
-    if getattr(fam, "fused_scan", False):
-        gr_f, f_f, faith_f = _lowering(
-            fam.build(B, H, nc, C, D, scale, fused_scan=True), binds, ref)
-        d = decide("chunk_h_scan", "chunk_h_scan",
-                   staged=lambda: gr.replay(binds), fused=lambda: gr_f.replay(binds),
-                   iters=iters)
-        if d.kept:
-            runner, f_fuser, faithful = gr_f, f_f, faith_f
-        scan_rec = dict(kept=bool(d.kept), gated_ok=bool(d.gated_ok),
-                        deterministic=bool(d.deterministic), faster=bool(d.faster),
-                        frob_vs_einsum=d.frob, ms_einsum=d.t_staged_ms,
-                        ms_fused=d.t_fused_ms, scan_speedup=d.speedup)
-        scan_note = (f"  [scan {'FUSE' if d.kept else 'stage'}: forward "
-                     f"{d.t_staged_ms:.3f}→{d.t_fused_ms:.3f}ms ({d.speedup:.2f}×), "
-                     f"frob {d.frob:.1e} {'det' if d.deterministic else 'NDET'}]")
+    # fuser: canonical forward -> compile (propose/verify/dispose over the transform
+    # pipeline: resident-state scan, glue absorption, read-mode/fused-store selection,
+    # each kept only on a gated + deterministic + measured win vs the canonical floor).
+    canon = fam.build(B, H, nc, C, D, scale)
+    result = compile_program(canon, Features(B, H, nc, C, D), bindings=binds,
+                             verify=True, iters=iters)
+    gr, f_fuser, faithful = _lowering(result.program, binds, ref)
+    kept = [r.name for r in result.report.kept]
+    compile_note = "  [compiled: " + (", ".join(kept) if kept else "canonical") + "]"
 
     # megakernel (2 reps; report consistent error, flag nondeterminism)
     mega = fam.mega_runner(inp, B, H, nc, C, D, scale, dev)
@@ -81,22 +69,21 @@ def _measure_config(fam, dev, H, nc, iters, mega_name):
     f_mega = min(reps)
     ndet = max(reps) > 2 * min(reps) + 1e-3
 
-    t_fuser = common.time_ms(lambda: runner.replay(binds, clone=False), iters=iters)
+    t_fuser = common.time_ms(lambda: gr.replay(binds, clone=False), iters=iters)
     t_mega = common.time_ms(mega, iters=iters)
 
     cap_note = "capture bit-exact" if faithful else "capture DIVERGED from staged"
-    lowering = "fused-scan" if (scan_rec and scan_rec["kept"]) else "einsum-scan"
     mega_note = f"frob {f_mega:.1e}" + ("  [NONDET]" if ndet else "")
     rows = [
         Measurement(mega_name, t_mega, note=mega_note),
-        Measurement("pto-fuser", t_fuser, note=f"{lowering}; frob {f_fuser:.1e}; {cap_note}"),
+        Measurement("pto-fuser", t_fuser,
+                    note=f"{len(kept)} transforms; frob {f_fuser:.1e}; {cap_note}"),
     ]
-    return rows, scan_note, dict(H=H, nc=nc, T=T, lowering=lowering,
-                                 frob=dict(fuser=f_fuser, mega=f_mega),
-                                 ms=dict(fuser=t_fuser, mega=t_mega),
-                                 speedup_vs_mega=t_mega / t_fuser,
-                                 bitexact=bool(faithful), mega_nondet=bool(ndet),
-                                 scan_decision=scan_rec)
+    return rows, compile_note, dict(H=H, nc=nc, T=T, transforms_kept=kept,
+                                    frob=dict(fuser=f_fuser, mega=f_mega),
+                                    ms=dict(fuser=t_fuser, mega=t_mega),
+                                    speedup_vs_mega=t_mega / t_fuser,
+                                    bitexact=bool(faithful), mega_nondet=bool(ndet))
 
 
 def run(fam, dev, configs, iters, outdir, title, slug, mega_name="megagdn"):

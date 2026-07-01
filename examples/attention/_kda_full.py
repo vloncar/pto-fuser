@@ -22,10 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from pto_fuser import (EinsumNode, FusedNode, OpaqueNode, Program, TensorOp,
-                       VecGlueNode)
-
-from ._chunked import select_prologue_kernel
+from pto_fuser import EinsumNode, OpaqueNode, Program, TensorOp, VecGlueNode
 
 
 def make_kda_inputs(B, H, nc, C, D, device, dtype=torch.float16) -> dict:
@@ -106,30 +103,16 @@ def prepare_kda_bindings(q, k, v, beta, g_in, work=torch.float16) -> dict:
     }
 
 
-def build_kda_program(B, H, nc, C, D, scale, work=torch.float16,
-                      fused_scan=False, fused_chunk_o=False,
-                      prologue_v2=None) -> Program:
-    """The full KDA forward (output ``o`` [B,H,nc,C,D]). Same equations as the GDN
-    forward; the gate enters via operand muls instead of score muls.
+def build_kda_program(B, H, nc, C, D, scale, work=torch.float16) -> Program:
+    """The full KDA forward as the **canonical** (all-staged) `Program` — output ``o``
+    [B,H,nc,C,D]. Same equations as the GDN forward; the gate enters via **per-dim**
+    operand muls (``exp(±g)``) instead of scalar score muls.
 
-    ``fused_scan`` swaps the unrolled einsum/glue cross-chunk scan for the
-    ``chunk_h_scan`` FusedNode (resident state, no per-chunk HBM round-trip), exactly
-    as the GDN forward does. The one KDA difference is the cross-chunk decay: GDN's is
-    a scalar ``exp(gₗ)`` per (b,h,c); KDA's is the **per-dimension** vector
-    ``exp(g_tot)`` (shape ``[D]``), decaying each K-row of ``S`` independently — so the
-    FusedNode is built with ``perdim_decay=True`` (selecting the kernel's
-    ``SCAN_PERDIM_DECAY`` variant, which row-broadcasts the decay vector across ``S``).
-    The within-chunk per-dim factor ``exp(g_tot−g)`` is absorbed into ``k`` (the
-    ``coef_krest`` mul), and ``v_new = U − W·S`` is recovered as one parallel batched
-    matmul. Identical ``o`` either way — the fusion-decide gate selects it on a win.
-
-    ``fused_chunk_o`` lowers chunk_o's intra score ``Aqk = tril((q·exp(g))(k·exp(-g))ᵀ)``
-    through the per-dim ``qk_prologue`` FusedNode — the PER-CHANNEL analog of GDN's scalar
-    ``gated_qk`` epilogue: KDA's gate is baked into the operands (``exp(±g)``), so the decay
-    folds into the matmul *load* (``qF⊙coef_ag``, ``kF⊙coef_bg``) rather than a scalar score
-    factor, and the causal mask (diag 0) rides in the kernel's Vec mask pass. ``q_eff`` still
-    materializes for ``o_inter`` (``q·h``); only the ``k_eff`` mul + Aqk einsum + tril +
-    contiguous are subsumed. ``prologue_v2`` (None = shape-gate) picks the L2-ring kernel."""
+    Like `build_gdn_program`, this is the always-valid staged lowering (scan unrolled,
+    no fused nodes) that the verifier gates against. Its optimized lowerings — the
+    per-dim resident-state scan (`chunk_h_scan` with ``perdim_decay``) and the per-dim
+    chunk_o glue absorption (`qk_prologue`) — are **transforms** applied by
+    ``pto_fuser.compile_program`` (see ``pto_fuser.transforms.kda``), not build flags."""
     M, N = B * H * nc, B * H
     nodes: list = []
 
@@ -166,58 +149,32 @@ def build_kda_program(B, H, nc, C, D, scale, work=torch.float16,
     T("Ub", "reshape", "U_m", shape=[N, nc, C, D])
     T("kb5", "reshape", "kF", shape=[N, nc, C, D])
 
-    if fused_scan:
-        # -- chunk_h scan via FusedNode (S resident on-chip, per-dim decay) ----- #
-        G("k_krest", "mul", ["kb5", "coef_krest"])             # kF·exp(g_tot-g) [N,nc,C,D]
-        for nm, src in (("sw", "Wb"), ("su", "Ub"), ("sk", "k_krest")):
-            T(f"{nm}5", "reshape", src, shape=[B, H, nc, C, D])
-            T(nm, "permute", f"{nm}5", dims=(0, 2, 3, 1, 4))   # -> kernel [B,nc,C,H,D]
-        T("sdecay", "reshape", "coef_S", shape=[B, H, nc, D])  # exp(g_tot) per (b,h,c,dim)
-        nodes.append(FusedNode(kernel="chunk_h_scan", inputs=["sw", "su", "sk", "sdecay"],
-                               outputs=["h_out_k", "final_k"],
-                               params={"B": B, "H": H, "nc": nc, "perdim_decay": True},
-                               subsumes=["nc per-chunk WS/kv matmul pairs + residual glue"]))
-        T("h_bhn", "permute", "h_out_k", dims=(0, 2, 1, 3, 4))  # [B,nc,H,D,D]->[B,H,nc,D,D]
-        T("h_flat", "reshape", "h_bhn", shape=[M, D, D])
-        E("WS_all", "nid,nde->nie", "W_m", "h_flat")           # parallel W·S (one dispatch)
-        G("vn_flat", "sub", ["U_m", "WS_all"])                 # v_new = U - W·S  [M,C,D]
-    else:
-        # -- chunk_h scan (resident S in HBM, unrolled) ------------------------- #
-        T("S0", "zeros", "Wb", shape=[N, D, D], dtype=work)
-        h_list, vn_list, S = [], [], "S0"
-        for c in range(nc):
-            h_list.append(S)
-            T(f"Wc{c}_s", "slice", "Wb", axis=1, index=c); T(f"Wc{c}", "contiguous", f"Wc{c}_s")
-            E(f"WS{c}", "nid,nde->nie", f"Wc{c}", S)
-            T(f"Uc{c}", "slice", "Ub", axis=1, index=c)
-            G(f"vn{c}", "sub", [f"Uc{c}", f"WS{c}"])                       # vc = U - W·S
-            vn_list.append(f"vn{c}")
-            T(f"kc{c}_s", "slice", "kb5", axis=1, index=c); T(f"kc{c}", "contiguous", f"kc{c}_s")
-            T(f"krc{c}", "slice", "coef_krest", axis=1, index=c)
-            G(f"krest{c}", "mul", [f"kc{c}", f"krc{c}"])                   # k·exp(g_tot-g)
-            E(f"dS{c}", "nid,nie->nde", f"krest{c}", f"vn{c}")            # kᵀ·vc
-            T(f"sc{c}", "slice", "coef_S", axis=1, index=c)
-            G(f"Sd{c}", "mul", [S, f"sc{c}"])                             # exp(g_tot)·S
-            S = G(f"S{c + 1}", "add", [f"Sd{c}", f"dS{c}"])
-        T("h_bh", "stack", h_list, dim=1); T("h_flat", "reshape", "h_bh", shape=[M, D, D])
-        T("vn_bh", "stack", vn_list, dim=1); T("vn_flat", "reshape", "vn_bh", shape=[M, C, D])
+    # -- chunk_h scan (resident S in HBM, unrolled, per-dim decay) ---------- #
+    T("S0", "zeros", "Wb", shape=[N, D, D], dtype=work)
+    h_list, vn_list, S = [], [], "S0"
+    for c in range(nc):
+        h_list.append(S)
+        T(f"Wc{c}_s", "slice", "Wb", axis=1, index=c); T(f"Wc{c}", "contiguous", f"Wc{c}_s")
+        E(f"WS{c}", "nid,nde->nie", f"Wc{c}", S)
+        T(f"Uc{c}", "slice", "Ub", axis=1, index=c)
+        G(f"vn{c}", "sub", [f"Uc{c}", f"WS{c}"])                       # vc = U - W·S
+        vn_list.append(f"vn{c}")
+        T(f"kc{c}_s", "slice", "kb5", axis=1, index=c); T(f"kc{c}", "contiguous", f"kc{c}_s")
+        T(f"krc{c}", "slice", "coef_krest", axis=1, index=c)
+        G(f"krest{c}", "mul", [f"kc{c}", f"krc{c}"])                   # k·exp(g_tot-g)
+        E(f"dS{c}", "nid,nie->nde", f"krest{c}", f"vn{c}")            # kᵀ·vc
+        T(f"sc{c}", "slice", "coef_S", axis=1, index=c)
+        G(f"Sd{c}", "mul", [S, f"sc{c}"])                             # exp(g_tot)·S
+        S = G(f"S{c + 1}", "add", [f"Sd{c}", f"dS{c}"])
+    T("h_bh", "stack", h_list, dim=1); T("h_flat", "reshape", "h_bh", shape=[M, D, D])
+    T("vn_bh", "stack", vn_list, dim=1); T("vn_flat", "reshape", "vn_bh", shape=[M, C, D])
 
     # -- chunk_o: o = (q·exp(g))·h + tril((q·exp(g))·(k·exp(-g))ᵀ,0)·v_new --- #
     G("q_eff", "mul", ["qF", "coef_ag"])                       # also feeds o_inter (q·h)
     E("o_inter", "nid,nde->nie", "q_eff", "h_flat")
-    if fused_chunk_o:
-        # per-dim PROLOGUE: fold exp(±g) into the matmul load, mask in the kernel.
-        kernel = (select_prologue_kernel(C, D) if prologue_v2 is None
-                  else "qk_prologue_v2" if prologue_v2 else "qk_prologue")
-        nodes.append(FusedNode(kernel=kernel,
-                               inputs=["qF", "kF", "coef_ag", "coef_bg"],
-                               outputs=["Aqk_c"],
-                               params={"nc": nc, "H": N, "C": C, "D": D},
-                               subsumes=["chunk_o k_eff mul + Aqk einsum + tril + contiguous"]))
-    else:
-        G("k_eff", "mul", ["kF", "coef_bg"])
-        E("Aqk", "nid,njd->nij", "q_eff", "k_eff")
-        G("Aqk_t", "tril", "Aqk", diagonal=0); T("Aqk_c", "contiguous", "Aqk_t")
+    G("k_eff", "mul", ["kF", "coef_bg"])
+    E("Aqk", "nid,njd->nij", "q_eff", "k_eff")
+    G("Aqk_t", "tril", "Aqk", diagonal=0); T("Aqk_c", "contiguous", "Aqk_t")
     E("o_intra", "nij,nje->nie", "Aqk_c", "vn_flat")
     G("o_sum", "add", ["o_inter", "o_intra"], out_dtype=torch.float32)
     G("o_s", "scale", "o_sum", scalar=scale, out_dtype=torch.float32)

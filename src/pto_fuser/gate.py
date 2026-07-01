@@ -1,4 +1,4 @@
-"""Correctness gating — non-negotiable (docs/FUSER_DESIGN.md §6).
+"""Correctness gating — non-negotiable (docs/DESIGN.md §6).
 
 Every non-default lowering is kept only if it passes, against the default staged
 lowering on identical inputs:

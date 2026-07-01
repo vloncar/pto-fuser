@@ -87,31 +87,26 @@ def test_select_prologue_kernel_shape_gate():
     assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in big.nodes)
 
 
-def test_kda_fused_chunk_o_program_builds():
-    """KDA chunk_o's intra score lowers to the per-dim qk_prologue FusedNode (the
-    per-channel analog of GDN's scalar gated_qk epilogue) over qF/kF and the exp(±g)
-    coefficients; same inputs/output. Shape gate picks V2 at C=D=128; prologue_v2=False
-    forces V1; the staged default keeps the chunk_o einsum + tril and no prologue node."""
+def test_kda_qk_prologue_transform():
+    """The AbsorbQKPrologue transform rewrites KDA chunk_o's intra score into the
+    per-dim qk_prologue FusedNode (the per-channel analog of GDN's scalar gated_qk
+    epilogue) over qF/kF and the exp(±g) coefficients; same output. Shape gate picks
+    V2 at C=D=128; v2=False forces V1; the canonical program has no prologue node."""
     from pto_fuser import FusedNode
-    from attention._kda_full import (build_kda_program, make_kda_inputs,
-                                     prepare_kda_bindings)
+    from pto_fuser.transforms import AbsorbQKPrologue
+    from attention._kda_full import build_kda_program
     B, H, nc, C, D = 1, 4, 2, 128, 128
-    inp = make_kda_inputs(B, H, nc, C, D, "cpu")
-    binds = prepare_kda_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
-    prog = build_kda_program(B, H, nc, C, D, D ** -0.5, fused_chunk_o=True)
+    canon = build_kda_program(B, H, nc, C, D, D ** -0.5)
+    assert not any(isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")
+                   for n in canon.nodes)                        # canonical: no prologue
+    prog = AbsorbQKPrologue(B, H, nc, C, D).apply(canon).program
     assert prog.outputs == ["o"]
-    assert sorted(prog.inputs) == sorted(binds.keys())
     pro = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")]
     assert len(pro) == 1 and pro[0].outputs == ["Aqk_c"]
     assert pro[0].inputs == ["qF", "kF", "coef_ag", "coef_bg"]
-    assert pro[0].kernel == "qk_prologue_v2"           # C·D = 16384 -> win regime
-    # forced V1
-    v1 = build_kda_program(B, H, nc, C, D, D ** -0.5, fused_chunk_o=True, prologue_v2=False)
+    assert pro[0].kernel == "qk_prologue_v2"                    # C·D = 16384 -> win regime
+    v1 = AbsorbQKPrologue(B, H, nc, C, D, v2=False).apply(canon).program
     assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue" for n in v1.nodes)
-    # staged default: no prologue FusedNode
-    staged = build_kda_program(B, H, nc, C, D, D ** -0.5)
-    assert not any(isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")
-                   for n in staged.nodes)
 
 
 def test_full_gdn_kda_programs_build():
@@ -131,72 +126,72 @@ def test_full_gdn_kda_programs_build():
         assert sorted(prog.inputs) == sorted(binds.keys())
 
 
-def test_gdn_fused_scan_program_builds():
-    """The chunk_h_scan resident-state lowering builds, hosts the FusedNode, and keeps
-    the same inputs/output as the einsum scan (the on-device gate is benchmarks/gdn_mega)."""
+def test_gdn_resident_scan_transform():
+    """LowerResidentScan rewrites GDN's unrolled scan into the chunk_h_scan FusedNode
+    and keeps the same output; the canonical program has no fused node and still
+    validates its bindings (on-device gate is benchmarks/gdn_mega)."""
     from pto_fuser import FusedNode
+    from pto_fuser.transforms import LowerResidentScan
     from attention._gdn_full import (build_gdn_program, make_gdn_inputs,
                                      prepare_gdn_bindings)
     B, H, nc, C, D = 1, 4, 2, 128, 128
     inp = make_gdn_inputs(B, H, nc, C, D, "cpu")
     binds = prepare_gdn_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
-    prog = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True)
+    canon = build_gdn_program(B, H, nc, C, D, D ** -0.5)
+    assert sorted(canon.inputs) == sorted(binds.keys())
+    assert not any(isinstance(n, FusedNode) for n in canon.nodes)     # canonical: staged
+    prog = LowerResidentScan(B, H, nc, C, D).apply(canon).program
     assert prog.outputs == ["o"]
-    assert sorted(prog.inputs) == sorted(binds.keys())
-    assert any(isinstance(n, FusedNode) and n.kernel == "chunk_h_scan" for n in prog.nodes)
+    fn = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel == "chunk_h_scan"]
+    assert len(fn) == 1 and "perdim_decay" not in fn[0].params      # GDN = scalar decay
 
 
-def test_gdn_fused_kkt_program_builds():
-    """The kkt_gated lowering builds, hosts the FusedNode, and keeps the same
-    inputs/output as the einsum kkt. Default fused_native=True selects the native
-    [M,C,D] kernel (no layout bridge); fused_native=False the mega-bridge kernel."""
+def test_gdn_gated_kkt_transform():
+    """AbsorbGatedKKT rewrites the kkt einsum+coefA mul+tril into kkt_gated_native
+    (native [M,C,D], no transpose bridge); v2 selects the FFTS-interleave kernel."""
     from pto_fuser import FusedNode, TensorOp
-    from attention._gdn_full import (build_gdn_program, make_gdn_inputs,
-                                     prepare_gdn_bindings)
+    from pto_fuser.transforms import AbsorbGatedKKT
+    from attention._gdn_full import build_gdn_program
     B, H, nc, C, D = 1, 4, 2, 128, 128
-    inp = make_gdn_inputs(B, H, nc, C, D, "cpu")
-    binds = prepare_gdn_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
-    # native (default): no transpose bridge, A produced directly
-    prog = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_kkt=True)
-    assert prog.outputs == ["o"]
-    assert sorted(prog.inputs) == sorted(binds.keys())
-    assert any(isinstance(n, FusedNode) and n.kernel == "kkt_gated_native" for n in prog.nodes)
+    canon = build_gdn_program(B, H, nc, C, D, D ** -0.5)
+    prog = AbsorbGatedKKT(nc, H).apply(canon).program
+    kkt = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("kkt_gated_native")]
+    assert len(kkt) == 1 and kkt[0].outputs == ["A"]
+    assert kkt[0].inputs == ["kF", "g_native", "beta_native"]
+    assert kkt[0].kernel == "kkt_gated_native"                        # v1 default
     assert not any(isinstance(n, TensorOp) and n.output == "k_kkt" for n in prog.nodes)
-    # mega bridge
-    megap = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_kkt=True,
-                              fused_native=False)
-    assert any(isinstance(n, FusedNode) and n.kernel == "kkt_gated" for n in megap.nodes)
+    v2 = AbsorbGatedKKT(nc, H, v2=True).apply(canon).program
+    assert any(isinstance(n, FusedNode) and n.kernel == "kkt_gated_native_v2" for n in v2.nodes)
 
 
-def test_gdn_fused_chunk_o_program_builds():
-    """chunk_o's Aqk lowers to the shared gated_qk FusedNode (q@kᵀ + on-chip
-    gate/causal-mask epilogue); same inputs/output as the einsum path. Native default."""
+def test_gdn_gated_chunk_o_transform():
+    """AbsorbGatedChunkO rewrites chunk_o's Aqk einsum+coef_o mul+contiguous into the
+    native gated_qk FusedNode (q@kᵀ + on-chip gate/causal-mask epilogue, β=1)."""
     from pto_fuser import FusedNode
-    from attention._gdn_full import (build_gdn_program, make_gdn_inputs,
-                                     prepare_gdn_bindings)
+    from pto_fuser.transforms import AbsorbGatedChunkO
+    from attention._gdn_full import build_gdn_program
     B, H, nc, C, D = 1, 4, 2, 128, 128
-    inp = make_gdn_inputs(B, H, nc, C, D, "cpu")
-    binds = prepare_gdn_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
-    prog = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_chunk_o=True)
-    assert prog.outputs == ["o"]
-    assert sorted(prog.inputs) == sorted(binds.keys())
-    assert any(isinstance(n, FusedNode) and n.kernel == "gated_qk_native" for n in prog.nodes)
-    megap = build_gdn_program(B, H, nc, C, D, D ** -0.5, fused_scan=True, fused_chunk_o=True,
-                              fused_native=False)
-    assert any(isinstance(n, FusedNode) and n.kernel == "gated_qk" for n in megap.nodes)
+    canon = build_gdn_program(B, H, nc, C, D, D ** -0.5)
+    prog = AbsorbGatedChunkO(nc, H).apply(canon).program
+    qk = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("gated_qk_native")]
+    assert len(qk) == 1 and qk[0].outputs == ["Aqk_c"]
+    assert qk[0].inputs == ["qF", "kF", "g_native", "beta_native_ones"]
+    assert qk[0].params.get("causal") is True
 
 
-def test_kda_fused_scan_program_builds():
-    """KDA's chunk_h_scan lowering builds with the per-dim-decay FusedNode and keeps
-    the same inputs/output as the einsum scan (on-device gate is benchmarks/kda_mega)."""
+def test_kda_perdim_scan_transform():
+    """LowerPerDimScan rewrites KDA's unrolled scan into the per-dim-decay chunk_h_scan
+    FusedNode; the canonical program still validates its bindings."""
     from pto_fuser import FusedNode
+    from pto_fuser.transforms import LowerPerDimScan
     from attention._kda_full import (build_kda_program, make_kda_inputs,
                                      prepare_kda_bindings)
     B, H, nc, C, D = 1, 4, 2, 128, 128
     inp = make_kda_inputs(B, H, nc, C, D, "cpu")
     binds = prepare_kda_bindings(inp["q"], inp["k"], inp["v"], inp["beta"], inp["g_in"])
-    prog = build_kda_program(B, H, nc, C, D, D ** -0.5, fused_scan=True)
+    canon = build_kda_program(B, H, nc, C, D, D ** -0.5)
+    assert sorted(canon.inputs) == sorted(binds.keys())
+    prog = LowerPerDimScan(B, H, nc, C, D).apply(canon).program
     assert prog.outputs == ["o"]
-    assert sorted(prog.inputs) == sorted(binds.keys())
     fn = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel == "chunk_h_scan"]
     assert len(fn) == 1 and fn[0].params.get("perdim_decay") is True

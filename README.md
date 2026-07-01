@@ -7,30 +7,32 @@ where the *graph-level* work lives: scheduling sequences of einsum-core stages, 
 foreign nodes, and Vec glue into efficient kernels.
 
 The guiding thesis (validated across the chunk-attention taxonomy): **fusion is a
-separate layer on top of the einsum primitives, not baked into `einsum()`.** The
-reusable unit is a tile-matmul core with pluggable load front-ends + epilogue, plus a
-registry of opaque hand-optimized nodes (e.g. triangular inverse) that the graph can
-host but that are not the matmul-core shape.
+separate layer on top of the einsum primitives, not baked into `einsum()`** — and within
+that layer the **transformation, the heuristic, and the verification are three separable
+pieces**. An optimization is a pure IR→IR *transform*; a *cost model* + *policy* decide
+which to attempt; a measure-and-gate *verifier* keeps each only on a proven win. Adding a
+lever is adding a rewrite + a cost prediction, not threading a build flag.
 
 ## Layout
 
-- `docs/FUSER_DESIGN.md` — the design (thesis, IR, optimization features, codegen
-  targets, correctness gating, build status).
-- `docs/IMPLEMENTATION.md` — what is actually built, tracked against the design. The
-  two are kept in sync: the design states the target, the implementation doc records
-  the realized state per feature.
-- `src/pto_fuser/` — the package: the IR (`ir.py`), the staged executor (`executor.py`),
-  the opaque-kernel registry (`registry.py`), the correctness gates (`gate.py`), the
-  read-mode / fused-store **Planner** (`planner.py`), the **graph-replay backend**
-  (`graph.py` — capture the staged chain, replay as one dispatch), the **fused-node
-  backend + fusion decision** (`fused.py` / `fusion.py` — host the resident-state scan
-  and gated-kkt kernels as single-dispatch nodes, kept only where they gate bit-faithful
-  + deterministic AND beat staged-captured), the hosted device kernels (`kernels/`), and
-  the reference forwards (`forwards/` — DeltaNet, GDN stages, the fused-stage
-  head-to-heads).
+- `docs/DESIGN.md` — the single design document: thesis, IR, the separated compilation
+  stack (transforms / cost / policy / verification), backends, gating, the transform
+  library, the worked forwards, and the roadmap toward megakernel generation.
+- `src/pto_fuser/` — the package:
+  - IR + backends: `ir.py`, `executor.py` (staged), `graph.py` (graph-replay),
+    `fused.py` (hosted fused kernels), `registry.py` (opaque tri-inv), `gate.py`.
+  - the separated stack: `transform.py` (canonical form + the universal read-mode /
+    fused-store transforms) and `transforms/` (the forward-shaped resident-scan and
+    glue-absorption rewrites); `cost.py` (the seeded cost model + `Features`);
+    `policy.py` (program+features → ordered transform pipeline); `compile.py`
+    (`compile_program` — the propose/verify/dispose driver); `report.py` (provenance).
+  - `fusion.py` / `planner.py` — the verification primitives (`decide`, per-node
+    read-mode measurement) the driver reuses; `kernels/` — the hosted device kernels;
+    `forwards/` — the DeltaNet reference + fused-stage head-to-heads.
 - `examples/` — runnable demonstrations: a minimal program, the chunked-attention zoo
-  (vanilla LA, RetNet, GLA, Mamba-2, GDN, KDA), one demo per feature (`workflow/`), and
-  the per-feature GDN benchmark (`benchmarks/`). See `examples/README.md`.
+  (vanilla LA, RetNet, GLA, Mamba-2, GDN, KDA), one demo per feature (`workflow/`), the
+  full `compile_program` forward (`attention/gdn.py`), and the fuser-vs-megakernel
+  benchmarks (`benchmarks/`). See `examples/README.md`.
 - `tests/` — off-NPU structural/decision/decomposition tests and NPU forward/feature
   tests. The `*_npu.py` device tests are skipped unless `PTO_RUN_NPU=1`, so the default
   `pytest` is the device-free suite.
