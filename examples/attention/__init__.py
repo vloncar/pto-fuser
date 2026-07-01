@@ -73,14 +73,22 @@ def gate_gla(N, nc, C, d_k, H, device, seed=1):
 # --------------------------------------------------------------------------- #
 #  Common driver
 # --------------------------------------------------------------------------- #
-def run_linear_variant(name: str, gate_fn, *, B=2, H=4, nc=4, C=16, d_k=64,
-                       d_v=64, tol=2e-2):
-    """Build → staged run → gate vs fp32 reference → capture (bit-exact) → time."""
-    from common import format_table, pick_device, time_ms        # examples/common
-    from pto_fuser import (GraphReplayExecutor, StagedExecutor, gate_outputs)
+def run_linear_variant(name: str, gate_fn, *, per_dim_gate=False, B=2, H=4, nc=4,
+                       C=16, d_k=64, d_v=64, tol=2e-2):
+    """Build canonical → compile (propose/verify/dispose) → gate vs fp32 reference.
+
+    The compile pass fuses the ``nc`` per-chunk intra-scores into one proven kernel
+    (``batch-chunk-intra-score``: ``gated_qk_native_v2`` for a scalar gate,
+    ``qk_prologue`` for GLA's per-channel gate) and selects read modes — each kept only
+    on a gated, deterministic, measured win. ``per_dim_gate`` is the forward-declared
+    gate kind (the one property the canonical IR cannot carry)."""
+    from common import pick_device                                # examples/common
+    from pto_fuser import (Features, GraphReplayExecutor, compile_program,
+                           frob_rel, gate_outputs)
 
     dev = pick_device()
-    print(f"\n=== {name}  (B={B} H={H} nc={nc} C={C} d_k={d_k} d_v={d_v}) ===")
+    print(f"\n=== {name}  (B={B} H={H} nc={nc} C={C} d_k={d_k} d_v={d_v}"
+          f"{' per-dim gate' if per_dim_gate else ''}) ===")
     if dev is None:
         print("  no healthy NPU — skipping the run (the Program still builds off-NPU).")
         build_chunked_linear_program(B * H, nc, C, d_k, d_v)
@@ -91,23 +99,17 @@ def run_linear_variant(name: str, gate_fn, *, B=2, H=4, nc=4, C=16, d_k=64,
     q, k, v = make_qkv(N, nc, C, d_k, d_v, dev, seed=0)
     gates = gate_fn(N, nc, C, d_k, H, dev)
     bindings = prepare_inputs(q, k, v, gates)
-    prog = build_chunked_linear_program(N, nc, C, d_k, d_v)
+    canon = build_chunked_linear_program(N, nc, C, d_k, d_v)
     ref = chunked_linear_reference(q, k, v, gates, B, H, nc, C)
 
-    staged = StagedExecutor().run(prog, bindings)
-    gates_res = gate_outputs(staged, ref, tol=tol)
+    result = compile_program(canon, Features(B, H, nc, C, d_k, per_dim_gate=per_dim_gate),
+                             bindings=bindings, iters=20)
+    print("  " + str(result.report).replace("\n", "\n  "))
+    got = GraphReplayExecutor().capture(result.program, bindings).replay(bindings)
+    gates_res = gate_outputs(got, ref, tol=tol)
     for r in gates_res:
         print("  " + str(r))
-
-    gr = GraphReplayExecutor().capture(prog, bindings)
-    replayed = gr.replay(bindings)
-    bitexact = all(torch.equal(replayed[n], staged[n]) for n in staged)
-    print(f"  capture/replay bit-exact vs staged: {bitexact}")
-
-    rows = [time_ms_row("staged", lambda: StagedExecutor().run(prog, bindings)),
-            time_ms_row("captured", lambda: gr.replay(bindings, clone=False))]
-    print(format_table(rows, baseline="staged"))
-    return all(r.passed for r in gates_res) and bitexact
+    return all(r.passed for r in gates_res)
 
 
 def time_ms_row(label, fn):

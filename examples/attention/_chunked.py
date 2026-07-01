@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import torch
 
-from pto_fuser import EinsumNode, FusedNode, Program, TensorOp, VecGlueNode
+from pto_fuser import EinsumNode, Program, TensorOp, VecGlueNode
 
 
 # --------------------------------------------------------------------------- #
@@ -70,32 +70,24 @@ def select_prologue_kernel(C: int, d_k: int) -> str:
 #  The Program
 # --------------------------------------------------------------------------- #
 def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
-                                 work=torch.float16, fused_intra: bool = False,
-                                 per_dim_gate: bool = False,
-                                 prologue_v2: "bool | None" = None) -> Program:
-    """Chunked linear attention over ``N = B*H`` batched heads, ``nc`` chunks.
+                                 work=torch.float16) -> Program:
+    """Chunked linear attention over ``N = B*H`` batched heads, ``nc`` chunks, as the
+    **canonical** (all-staged) `Program`.
 
     Bindings (all batched over ``N``, chunk-major):
         q, k    : [N, nc, C, d_k]      v       : [N, nc, C, d_v]
         P, invP : [N, nc, C, d_k]      gammaInvP : [N, nc, C, d_k]   (= γ/P)
         gamma   : [N, nc, d_k]         (the whole-chunk gate, for the state decay)
+        g_intra : [N·nc, C]            (scalar log-cumgate) + beta_intra ones — declared
+                                       so the batch-chunk-intra-score transform validates
     Output:
         o       : [N, nc, C, d_v]
 
-    ``fused_intra`` fuses the per-chunk intra-chunk score ``A = tril(q̃ k̂ᵀ)`` into ONE
-    kernel over all ``M = N·nc`` chunks (replacing the per-chunk ``A`` einsum + ``tril``).
-    Two lowerings, split by where the decay sits relative to the contraction Σ_d:
-
-    * ``per_dim_gate=False`` (SCALAR gate — vanilla/RetNet/Mamba-2): ``A`` factors as
-      ``(q kᵀ)·exp(min(gᵢ-gⱼ,0))·causal`` with the *scalar* log-cumgate ``g`` (the decay
-      falls OUT of Σ_d), so the score is the SAME ``gated_qk_native_v2`` EPILOGUE the GDN
-      ``kkt`` stage uses — q/k feed in raw + ``g_intra`` [N·nc, C] (scalar log P), ``beta_intra``
-      ones. The whole scalar family shares this kernel, swapping only ``g``.
-    * ``per_dim_gate=True`` (PER-CHANNEL gate — GLA/KDA): ``P_id`` lives INSIDE Σ_d, so no
-      scalar coeff reproduces it; the decay rides on the OPERANDS — a ``qk_prologue``
-      kernel applies ``q⊙P`` / ``k⊙invP`` (Vec prologue) ahead of the matmul, then masks.
-      Binds the existing ``P``/``invP`` decay tensors (no ``g_intra``). The parallel lever.
-    """
+    The intra-chunk score ``A_c = tril(q̃_c k̂_cᵀ, 0)`` is unrolled per chunk here; the
+    ``batch-chunk-intra-score`` transform (``pto_fuser.transforms.chunked``) collapses all
+    ``nc`` into one batched proven kernel (``gated_qk_native_v2`` for a scalar gate, or
+    ``qk_prologue`` for a per-channel gate — the gate kind is a compile option, not a
+    build flag)."""
     nodes: list = []
 
     def E(out, eq, a, b):
@@ -107,32 +99,6 @@ def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
     def T(out, op, ins, **p):
         ins = ins if isinstance(ins, list) else [ins]
         nodes.append(TensorOp(op, ins, out, params=p)); return out
-
-    if fused_intra:
-        # ONE intra-score kernel over all chunks: A_all[m], m = n·nc + c. q/k feed in
-        # ([N,nc,C,d_k] reshapes to [M,C,d_k]); the kernel keys C/d_k via -D. Reshape the
-        # [M,C,C] result back to [N,nc,C,C] so the loop slices chunk c as it did staged A.
-        if per_dim_gate:
-            # per-channel decay -> operand PROLOGUE (q⊙P, k⊙invP) ahead of the matmul.
-            # v2 keeps the scaled operands in an L2 ring (no full [M,C,D] qd/kinv scratch);
-            # prologue_v2=None auto-selects V1/V2 by shape (select_prologue_kernel).
-            kernel = (select_prologue_kernel(C, d_k) if prologue_v2 is None
-                      else "qk_prologue_v2" if prologue_v2 else "qk_prologue")
-            nodes.append(FusedNode(kernel=kernel,
-                                   inputs=["q", "k", "P", "invP"],
-                                   outputs=["A_all"],
-                                   params={"nc": nc, "H": N, "C": C, "D": d_k},
-                                   subsumes=[f"Am{c}" for c in range(nc)]))
-        else:
-            # scalar decay -> gated EPILOGUE. v2 (per-tile FFTS interleave) is the winning
-            # path AND the only correct one at small chunks — v1's batched two-pass routes
-            # through the cross-tile matmul pipeline, which mis-tiles tiny Mt/Nt (C<=32).
-            nodes.append(FusedNode(kernel="gated_qk_native_v2",
-                                   inputs=["q", "k", "g_intra", "beta_intra"],
-                                   outputs=["A_all"],
-                                   params={"nc": nc, "H": N, "C": C, "D": d_k, "causal": True},
-                                   subsumes=[f"Am{c}" for c in range(nc)]))
-        T("A_allr", "reshape", "A_all", shape=(N, nc, C, C))
 
     T("S0", "zeros", "q", shape=(N, d_k, d_v), dtype=work)
     outs, S = [], "S0"
@@ -148,11 +114,8 @@ def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
         G(f"kout{c}", "mul", [f"k{c}", f"gammaInvP{c}"])
 
         # intra-chunk attention with decay:  tril(q̃ k̂ᵀ, 0) · V
-        if fused_intra:
-            T(f"Am{c}", "slice", "A_allr", axis=1, index=c)       # fused gated score
-        else:
-            E(f"A{c}", "nid,njd->nij", f"qd{c}", f"kinv{c}")
-            G(f"Am{c}", "tril", [f"A{c}"], diagonal=0)
+        E(f"A{c}", "nid,njd->nij", f"qd{c}", f"kinv{c}")
+        G(f"Am{c}", "tril", [f"A{c}"], diagonal=0)
         E(f"o_intra{c}", "nij,nje->nie", f"Am{c}", f"v{c}")
         # inter-chunk:  q̃ · S_in
         E(f"o_inter{c}", "nid,nde->nie", f"qd{c}", S)
@@ -165,9 +128,9 @@ def build_chunked_linear_program(N: int, nc: int, C: int, d_k: int, d_v: int,
         S = G(f"S{c+1}", "add", [f"Sdec{c}", f"dS{c}"], out_dtype=work)
 
     T("o", "stack", outs, dim=1)                                  # [N, nc, C, d_v]
-    inputs = ["q", "k", "v", "P", "invP", "gammaInvP", "gamma"]
-    if fused_intra and not per_dim_gate:
-        inputs += ["g_intra", "beta_intra"]   # scalar epilogue needs g; per-dim uses P/invP
+    # g_intra/beta_intra are consumed only after the scalar batch-chunk-intra-score
+    # transform fires; declared here (like GDN's g_native) so that rewrite validates.
+    inputs = ["q", "k", "v", "P", "invP", "gammaInvP", "gamma", "g_intra", "beta_intra"]
     return Program(nodes=nodes, inputs=inputs, outputs=["o"])
 
 
@@ -185,13 +148,14 @@ def decide_fused_intra(N, nc, C, d_k, d_v, gates, dev, *, per_dim_gate, iters=20
     shape-selected). The fuser keeps the fused kernel only on a gated-green + deterministic
     + faster win — otherwise the staged-captured lowering stands (the lever ordering)."""
     from pto_fuser import GraphReplayExecutor, decide
+    from pto_fuser.transforms import BatchChunkIntraScore
     q, k, v = make_qkv(N, nc, C, d_k, d_v, dev)
     binds = prepare_inputs(q, k, v, gates)
-    staged = GraphReplayExecutor().capture(
-        build_chunked_linear_program(N, nc, C, d_k, d_v), binds)
-    fused = GraphReplayExecutor().capture(
-        build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True,
-                                     per_dim_gate=per_dim_gate), binds)
+    canon = build_chunked_linear_program(N, nc, C, d_k, d_v)
+    fused_prog = BatchChunkIntraScore(N, nc, C, d_k, d_v,
+                                      per_dim_gate=per_dim_gate).apply(canon).program
+    staged = GraphReplayExecutor().capture(canon, binds)
+    fused = GraphReplayExecutor().capture(fused_prog, binds)
     kern = select_prologue_kernel(C, d_k) if per_dim_gate else "gated_qk_native_v2"
     return decide("chunk_intra", kern,
                   lambda: staged.replay(binds, clone=False),

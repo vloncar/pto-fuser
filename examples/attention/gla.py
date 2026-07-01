@@ -14,4 +14,4 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from attention import gate_gla, run_linear_variant  # noqa: E402
 
 if __name__ == "__main__":
-    run_linear_variant("GLA (gated linear attention)", gate_gla)
+    run_linear_variant("GLA (gated linear attention)", gate_gla, per_dim_gate=True)

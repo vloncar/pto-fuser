@@ -8,5 +8,6 @@ by the forward's dims, matching the canonical (all-staged) scan the builders emi
 """
 from .gdn import LowerResidentScan
 from .kda import LowerPerDimScan
+from .chunked import BatchChunkIntraScore
 
-__all__ = ["LowerResidentScan", "LowerPerDimScan"]
+__all__ = ["LowerResidentScan", "LowerPerDimScan", "BatchChunkIntraScore"]

@@ -32,59 +32,58 @@ def test_minimal_and_chunked_programs_build():
     assert build_chunked_linear_program(8, 4, 16, 64, 64).outputs == ["o"]
 
 
-def test_chunked_fused_intra_program_builds():
-    """fused_intra (scalar-gated zoo) replaces the per-chunk A einsum + tril with ONE
-    gated_qk_native_v2 FusedNode over all M=N·nc chunks; the staged default keeps the
-    einsum path. Verifies the opt-in lever's structure + extra scalar-gate bindings."""
+def test_batch_chunk_intra_scalar():
+    """BatchChunkIntraScore (scalar-gated zoo) replaces the nc per-chunk A einsum + tril
+    with ONE gated_qk_native_v2 FusedNode over all M=N·nc chunks; canonical keeps the
+    einsum path and declares the g_intra/beta_intra bindings the fused kernel needs."""
     from pto_fuser import EinsumNode, FusedNode
+    from pto_fuser.transforms import BatchChunkIntraScore
     from attention._chunked import build_chunked_linear_program, prepare_inputs, make_qkv
     from attention import gate_retnet
     N, nc, C, d_k, d_v = 8, 4, 16, 64, 64
-    prog = build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True)
-    # one fused gated score over all chunks, no per-chunk q̃k̂ᵀ einsum (eq "nid,njd->nij")
-    assert any(isinstance(n, FusedNode) and n.kernel == "gated_qk_native_v2" for n in prog.nodes)
+    canon = build_chunked_linear_program(N, nc, C, d_k, d_v)
+    assert any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in canon.nodes)
+    assert not any(isinstance(n, FusedNode) for n in canon.nodes)
+    assert canon.inputs[-2:] == ["g_intra", "beta_intra"]        # declared for the transform
+    prog = BatchChunkIntraScore(N, nc, C, d_k, d_v).apply(canon).program
+    a_all = [n for n in prog.nodes if isinstance(n, FusedNode)]
+    assert len(a_all) == 1 and a_all[0].kernel == "gated_qk_native_v2"
+    assert a_all[0].inputs == ["q", "k", "g_intra", "beta_intra"]
     assert not any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in prog.nodes)
-    assert prog.inputs[-2:] == ["g_intra", "beta_intra"]
-    # staged default still carries the per-chunk score einsum and no FusedNode
-    staged = build_chunked_linear_program(N, nc, C, d_k, d_v)
-    assert any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in staged.nodes)
-    assert not any(isinstance(n, FusedNode) for n in staged.nodes)
-    # the scalar-gate bindings prepare_inputs adds match the new Program inputs
     q, k, v = make_qkv(N, nc, C, d_k, d_v, "cpu")
     binds = prepare_inputs(q, k, v, gate_retnet(N, nc, C, d_k, 4, "cpu"))
     assert binds["g_intra"].shape == (N * nc, C) and binds["beta_intra"].shape == (N * nc, C)
 
 
-def test_chunked_fused_intra_per_dim_program_builds():
-    """per_dim_gate (GLA/KDA): the intra score lowers to the qk_prologue FusedNode
-    (operand prescale q⊙P/k⊙invP ahead of the matmul) over the existing P/invP decay
-    tensors — no g_intra/beta_intra (those are the scalar-epilogue path's)."""
+def test_batch_chunk_intra_per_dim():
+    """per_dim_gate (GLA): the intra score lowers to the qk_prologue FusedNode (operand
+    prescale q⊙P / k⊙invP ahead of the matmul) over the P/invP decay tensors; v2 selects
+    the L2-ring kernel."""
     from pto_fuser import EinsumNode, FusedNode
+    from pto_fuser.transforms import BatchChunkIntraScore
     from attention._chunked import build_chunked_linear_program
     N, nc, C, d_k, d_v = 8, 4, 16, 64, 64
-    prog = build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True, per_dim_gate=True)
-    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue" for n in prog.nodes)
+    canon = build_chunked_linear_program(N, nc, C, d_k, d_v)
+    prog = BatchChunkIntraScore(N, nc, C, d_k, d_v, per_dim_gate=True).apply(canon).program
+    pro = [n for n in prog.nodes if isinstance(n, FusedNode)]
+    assert len(pro) == 1 and pro[0].kernel == "qk_prologue"      # C·d_k=1024 -> V1
+    assert pro[0].inputs == ["q", "k", "P", "invP"]
     assert not any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in prog.nodes)
-    # per-dim uses P/invP (already inputs); it does NOT add the scalar-epilogue bindings
-    assert "g_intra" not in prog.inputs and "beta_intra" not in prog.inputs
-    pro = [n for n in prog.nodes if isinstance(n, FusedNode)][0]
-    assert pro.inputs == ["q", "k", "P", "invP"]
-    # prologue_v2 selects the L2-resident ring kernel (same inputs/structure)
-    progv2 = build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True,
-                                          per_dim_gate=True, prologue_v2=True)
-    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in progv2.nodes)
+    v2 = BatchChunkIntraScore(N, nc, C, d_k, d_v, per_dim_gate=True, v2=True).apply(canon).program
+    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in v2.nodes)
 
 
 def test_select_prologue_kernel_shape_gate():
     """The per-dim prologue picks V1 at tiny tiles and V2 where the prescale is
-    bandwidth-heavy (C·d_k >= 4096, the measured win regime); build_*_program
-    auto-selects when prologue_v2 is left None (the default)."""
+    bandwidth-heavy (C·d_k >= 4096, the measured win regime)."""
     from pto_fuser import FusedNode
+    from pto_fuser.transforms import BatchChunkIntraScore
     from attention._chunked import select_prologue_kernel, build_chunked_linear_program
     assert select_prologue_kernel(16, 64) == "qk_prologue"       # 1024, tiny tile
     assert select_prologue_kernel(64, 128) == "qk_prologue_v2"   # 8192, win regime
-    # auto-select (prologue_v2=None) flows the shape gate into the Program
-    big = build_chunked_linear_program(8, 4, 64, 128, 128, fused_intra=True, per_dim_gate=True)
+    # the transform's shape gate (v2=None auto) flows into the emitted kernel
+    canon = build_chunked_linear_program(8, 4, 64, 128, 128)
+    big = BatchChunkIntraScore(8, 4, 64, 128, 128, per_dim_gate=True).apply(canon).program
     assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in big.nodes)
 
 

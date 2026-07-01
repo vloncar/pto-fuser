@@ -38,6 +38,7 @@ class Features:
     C: int
     D: int
     dtype: torch.dtype = torch.float16
+    per_dim_gate: bool = False       # forward-declared gate kind (linear family: GLA vs scalar)
 
     @property
     def T(self) -> int:
@@ -102,6 +103,15 @@ class CostModel:
             # B1H4nc8, 2.28× at B8H32nc16).
             return Prediction(1.0 + 0.05 * feat.nc,
                               f"resident state removes {feat.nc} per-chunk S round-trips")
+        if name == "batch-chunk-intra-score":
+            # Collapses nc per-chunk tiny intra-score einsums into one batched proven
+            # kernel — a dispatch + round-trip win that grows with chunk count; the
+            # scalar family uses the gated epilogue, GLA the operand prologue. v2
+            # (L2-ring / FFTS interleave) pays where the score/head product is large.
+            v2 = feat.C * feat.D >= 4096
+            return Prediction(0.5 + 0.05 * feat.nc,
+                              "batch nc per-chunk intra-scores into one proven kernel",
+                              v2=v2)
         if name == "fuse-contraction-epilogue":
             # Region-driven glue absorption (contraction + epilogue -> one gated-matmul
             # kernel): keeps the qk matrix on-chip; the glue share grows with head count

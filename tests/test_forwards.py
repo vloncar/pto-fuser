@@ -20,7 +20,10 @@ VARIANTS = {"vanilla": gate_vanilla, "retnet": gate_retnet,
 def test_chunked_program_structure():
     B, H, nc, C, d_k, d_v = 2, 4, 4, 16, 64, 64
     prog = build_chunked_linear_program(B * H, nc, C, d_k, d_v)
-    assert prog.inputs == ["q", "k", "v", "P", "invP", "gammaInvP", "gamma"]
+    # g_intra/beta_intra are declared (unused in canonical) so the batch-chunk-intra-score
+    # transform validates — like GDN's g_native.
+    assert prog.inputs == ["q", "k", "v", "P", "invP", "gammaInvP", "gamma",
+                           "g_intra", "beta_intra"]
     assert prog.outputs == ["o"]
     from pto_fuser import EinsumNode
     # 4 einsum cores per chunk (intra qk, intra·v, inter, state-update).

@@ -218,6 +218,12 @@ program without it stands.
   2.28× at B8H32nc16), not just launch-bound. KDA differs only in a per-dimension decay
   vector (`perdim_decay=True`, an `[B,H,nc,D]` operand). Each matches only its own family
   and is idempotent; the rewrite is byte-identical to the hand-written fused lowering.
+- **`batch-chunk-intra-score`** (`transforms/chunked.py`) — the linear family
+  (vanilla/RetNet/Mamba-2/GLA) unrolls its intra-chunk score per chunk; this collapses all
+  `nc` per-chunk `tril(q̃·k̂ᵀ)` scores into ONE batched proven kernel over `M = N·nc`,
+  reusing `gated_qk_native_v2` (scalar gate) or `qk_prologue` (GLA per-channel). The gate
+  kind is a forward-declared option (`Features.per_dim_gate`). This is the §8 B2 widening —
+  more coverage for the proven kernels, no new device code.
 
 ### Structural — contraction+epilogue template emission (`template.py`, §8)
 
@@ -306,10 +312,19 @@ pattern):
    speculatively. This keeps the discipline: the generator only ever emits proven kernels.
    Still excluded, by the physical Cube↔Vec GM-only constraint: 2D-mask-in-fixpipe and
    speculative on-chip Cube↔Vec datapaths.
-3. **Widen the template class one proven pattern at a time** — per-tile FFTS interleave,
-   then cube+vec mix kernels, then 2D-mask Vec passes — each hand-prototyped and gated
-   first, then folded into the generator. Mix kernels with FFTS come only after the
-   single-unit templates are solid.
+3. **Widen the template class one proven pattern at a time** — **first widening realized**
+   (`transforms/chunked.py`, `BatchChunkIntraScore`). The linear family (vanilla LA,
+   RetNet, Mamba-2, GLA) unrolls its intra-chunk score per chunk; this transform collapses
+   all `nc` per-chunk scores into ONE batched kernel over `M = N·nc`, **reusing the proven
+   kernels** the GDN/KDA templates already use — `gated_qk_native_v2` for a scalar gate,
+   `qk_prologue` for GLA's per-channel gate — so the whole linear family now compiles
+   through the generator with **no new device code** (byte-identical to the hand-written
+   `fused_intra` lowering; NPU-verified RetNet + GLA). The gate kind (scalar vs per-dim) is
+   the one property the canonical IR cannot carry, so it is a forward-declared compile
+   option (`Features.per_dim_gate`) — a concrete signal for the eventual frontend. Further
+   widenings (cube+vec mix kernels, then a genuinely new device kernel such as the deferred
+   fixpipe-1D scale) follow the same rule: hand-prove the pattern, then fold it in — the
+   generator never emits an unproven kernel.
 
 **Deferred (not started; the eventual end goal).** Integration into the `cce-mlir`
 compiler stack, which operates on the lower-level CCE intrinsics below the pto tile
