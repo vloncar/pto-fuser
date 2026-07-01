@@ -62,8 +62,16 @@ template <typename CFG>
 AICORE inline void kkt_epilogue_one(__gm__ const float* qk_base, __gm__ const float* g_t,
                                     __gm__ const half* beta_t, __gm__ const float* mask,
                                     __gm__ half* L, unsigned pid, unsigned vid) {
-    constexpr unsigned C = CFG::n_contract;          // 128
-    constexpr unsigned HalfC = C / 2;                // 64
+    // Score-matrix dim = chunk size = n_free0 (i==j axis), NOT n_contract (head dim D).
+    // They coincide at C==D==128 (GDN), but the zoo runs C!=D (e.g. C=16, D=64), so the
+    // epilogue must index the [C,C] qk tile / g / β / mask by the free dim, not D.
+    constexpr unsigned C = CFG::n_free0;
+    constexpr unsigned HalfC = C / 2;
+    // A RowMajor half tile needs its row width 32-byte aligned (Cols*2 % 32 == 0 ->
+    // Cols a multiple of 16). The per-row β vector is HalfC wide, which is < 16 for the
+    // smallest chunk (C=16 -> HalfC=8). Pad the β tile's *static* width to a 16-multiple
+    // and load only HalfC valid cols; the float tiles (Cols*4 % 32) are fine at HalfC>=8.
+    constexpr unsigned BetW = (HalfC + 15) / 16 * 16;
     constexpr int32_t Hh = CFG::kkt_H;
     constexpr int64_t Tt = CFG::kkt_T;
 
@@ -93,7 +101,7 @@ AICORE inline void kkt_epilogue_one(__gm__ const float* qk_base, __gm__ const fl
     using TileGc  = Tile<TileType::Vec, float, 1, C, BLayout::RowMajor, -1, -1>;
     using TileGr  = Tile<TileType::Vec, float, 1, HalfC, BLayout::RowMajor, -1, -1>;
     using TileGvC = Tile<TileType::Vec, float, HalfC, 1, BLayout::ColMajor, -1, -1>;
-    using TileBh  = Tile<TileType::Vec, half,  1, HalfC, BLayout::RowMajor, -1, -1>;
+    using TileBh  = Tile<TileType::Vec, half,  1, BetW, BLayout::RowMajor, -1, -1>;
     using TileHout= Tile<TileType::Vec, half,  HalfC, C, BLayout::RowMajor, -1, -1>;
 
     using GmF   = GlobalTensor<float, Shape<1,1,1,-1,C>, Stride<1,1,1,C,1>>;

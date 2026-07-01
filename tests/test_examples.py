@@ -31,6 +31,49 @@ def test_minimal_and_chunked_programs_build():
     assert build_chunked_linear_program(8, 4, 16, 64, 64).outputs == ["o"]
 
 
+def test_chunked_fused_intra_program_builds():
+    """fused_intra (scalar-gated zoo) replaces the per-chunk A einsum + tril with ONE
+    gated_qk_native_v2 FusedNode over all M=N·nc chunks; the staged default keeps the
+    einsum path. Verifies the opt-in lever's structure + extra scalar-gate bindings."""
+    from pto_fuser import EinsumNode, FusedNode
+    from attention._chunked import build_chunked_linear_program, prepare_inputs, make_qkv
+    from attention import gate_retnet
+    N, nc, C, d_k, d_v = 8, 4, 16, 64, 64
+    prog = build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True)
+    # one fused gated score over all chunks, no per-chunk q̃k̂ᵀ einsum (eq "nid,njd->nij")
+    assert any(isinstance(n, FusedNode) and n.kernel == "gated_qk_native_v2" for n in prog.nodes)
+    assert not any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in prog.nodes)
+    assert prog.inputs[-2:] == ["g_intra", "beta_intra"]
+    # staged default still carries the per-chunk score einsum and no FusedNode
+    staged = build_chunked_linear_program(N, nc, C, d_k, d_v)
+    assert any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in staged.nodes)
+    assert not any(isinstance(n, FusedNode) for n in staged.nodes)
+    # the scalar-gate bindings prepare_inputs adds match the new Program inputs
+    q, k, v = make_qkv(N, nc, C, d_k, d_v, "cpu")
+    binds = prepare_inputs(q, k, v, gate_retnet(N, nc, C, d_k, 4, "cpu"))
+    assert binds["g_intra"].shape == (N * nc, C) and binds["beta_intra"].shape == (N * nc, C)
+
+
+def test_chunked_fused_intra_per_dim_program_builds():
+    """per_dim_gate (GLA/KDA): the intra score lowers to the qk_prologue FusedNode
+    (operand prescale q⊙P/k⊙invP ahead of the matmul) over the existing P/invP decay
+    tensors — no g_intra/beta_intra (those are the scalar-epilogue path's)."""
+    from pto_fuser import EinsumNode, FusedNode
+    from attention._chunked import build_chunked_linear_program
+    N, nc, C, d_k, d_v = 8, 4, 16, 64, 64
+    prog = build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True, per_dim_gate=True)
+    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue" for n in prog.nodes)
+    assert not any(isinstance(n, EinsumNode) and n.equation == "nid,njd->nij" for n in prog.nodes)
+    # per-dim uses P/invP (already inputs); it does NOT add the scalar-epilogue bindings
+    assert "g_intra" not in prog.inputs and "beta_intra" not in prog.inputs
+    pro = [n for n in prog.nodes if isinstance(n, FusedNode)][0]
+    assert pro.inputs == ["q", "k", "P", "invP"]
+    # prologue_v2 selects the L2-resident ring kernel (same inputs/structure)
+    progv2 = build_chunked_linear_program(N, nc, C, d_k, d_v, fused_intra=True,
+                                          per_dim_gate=True, prologue_v2=True)
+    assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in progv2.nodes)
+
+
 def test_full_gdn_kda_programs_build():
     """The end-to-end gated forwards build + their host-coefficient bindings match the
     Program inputs (off-NPU; the on-device numeric gate is benchmarks/{gdn,kda}_mega)."""

@@ -1,6 +1,10 @@
 // Config + host ABI for the fused-kkt prototype. Shape: kc_exp [NC, C, H, D],
-// C=D=128, "bihd,bjhd->bihj" NT direct-read. NC (#chunks) and H (#heads) come from
-// -DKKT_NC / -DKKT_H so one .so serves a given (nc,H); rebuilt per workload.
+// "bihd,bjhd->bihj" NT direct-read. NC (#chunks), H (#heads), C (chunk size) and
+// D (head dim) all come from -DKKT_NC / -DKKT_H / -DKKT_C / -DKKT_D so one .so serves
+// a given (nc,H,C,D); rebuilt per workload. C and D default to 128 (GDN/KDA), but the
+// zoo mechanisms run smaller chunks/heads (e.g. C=16, D=64) — the matmul geom clamps
+// its 128 tiles to min(tile, padded-dim), so the only C/D-dependence is the strides
+// here and the score-dim (n_free0) the epilogue indexes by.
 #include "kkt_fused.h"
 
 #ifndef KKT_NC
@@ -9,8 +13,12 @@
 #ifndef KKT_H
 #define KKT_H 32
 #endif
+#ifndef KKT_C
 #define KKT_C 128
+#endif
+#ifndef KKT_D
 #define KKT_D 128
+#endif
 
 #ifdef KKT_NATIVE
 // Step 3: native [M,C,D] layout (M = nc*H, heads OUTER) — the Program's own batch.

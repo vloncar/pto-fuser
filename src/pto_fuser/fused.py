@@ -18,8 +18,10 @@ inline is the unproven part and is not used here):
   * ``kkt_gated``    — the matmul-core + on-chip gated/masked epilogue (glue absorption /
     glue absorption). The qk intermediate never lands in HBM.
 
-Compile-time shape (``KKT_NC``/``KKT_H``; ``SCAN_B``/``SCAN_H``/``SCAN_NC``) keys the
-``.so``; ``C = D = 128`` are fixed in the prototypes.
+Compile-time shape (``KKT_NC``/``KKT_H`` + ``KKT_C``/``KKT_D``; ``SCAN_B``/``SCAN_H``/
+``SCAN_NC``) keys the ``.so``. The native-kkt path parameterizes the chunk/head dims
+(``KKT_C``/``KKT_D``, default 128) so the zoo mechanisms run at their own ``C``/``D``
+(e.g. ``C = 16, D = 64``); ``scan`` is still ``C = D = 128``.
 """
 from __future__ import annotations
 
@@ -225,21 +227,23 @@ def _gated_qk_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
 
 
 # -- native [M,C,D] variants (Step 3): operands feed straight in, no layout bridge -- #
-def _gated_qk_run_native(lib, ws, a, b, g_native, beta_native, M, causal,
+def _gated_qk_run_native(lib, ws, a, b, g_native, beta_native, M, C, D, causal,
                          v2=False) -> List[torch.Tensor]:
     """Same gated a@bᵀ epilogue, but the kernel reads the Program's NATIVE [M,C,D]
     batch (heads outer) and writes L [M,C,C] — no transpose into the mega [1,T,H,D]
     layout, so q@kᵀ (chunk_o) pays zero operand shuffles. g/β are per-M-row [M,C].
+    ``C``/``D`` are the chunk size and head dim (default 128 for GDN/KDA; the zoo runs
+    smaller, e.g. C=16, D=64 — they key the .so via -DKKT_C/-DKKT_D, see ``defines``).
     ``v2`` selects the per-tile FFTS-interleave kernel (no qk HBM round-trip)."""
     dev = a.device
-    a_flat = a.reshape(M, KKT_C, KKT_D).contiguous().half()
-    b_flat = b.reshape(M, KKT_C, KKT_D).contiguous().half()
-    g_t = g_native.reshape(M, KKT_C).contiguous().float()
-    beta_t = beta_native.reshape(M, KKT_C).contiguous().half()
-    rows = torch.arange(KKT_C, device=dev)
+    a_flat = a.reshape(M, C, D).contiguous().half()
+    b_flat = b.reshape(M, C, D).contiguous().half()
+    g_t = g_native.reshape(M, C).contiguous().float()
+    beta_t = beta_native.reshape(M, C).contiguous().half()
+    rows = torch.arange(C, device=dev)
     rel = rows[:, None] >= rows[None, :] if causal else rows[:, None] > rows[None, :]
     mask = rel.float().contiguous()
-    L = torch.zeros(M, KKT_C, KKT_C, device=dev, dtype=torch.float16)
+    L = torch.zeros(M, C, C, device=dev, dtype=torch.float16)
     exec_fn = lib.kkt_exec_v2 if v2 else lib.kkt_exec
     exec_fn(_vp(a_flat), _vp(b_flat), _vp(g_t), _vp(beta_t), _vp(mask), ws, _vp(L),
             ctypes.c_int32(0), ctypes.c_int64(0), _stream())
@@ -249,28 +253,90 @@ def _gated_qk_run_native(lib, ws, a, b, g_native, beta_native, M, causal,
 def _kkt_native_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
     k, g_native, beta_native = inputs              # [M,C,D] half, [M,C] f32, [M,C] half
     return _gated_qk_run_native(lib, ws, k, k, g_native, beta_native,
-                                params["nc"] * params["H"], causal=False,
-                                v2=params.get("v2", False))
+                                params["nc"] * params["H"],
+                                params.get("C", KKT_C), params.get("D", KKT_D),
+                                causal=False, v2=params.get("v2", False))
 
 
 def _gated_qk_native_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
     a, b, g_native, beta_native = inputs
     return _gated_qk_run_native(lib, ws, a, b, g_native, beta_native,
-                                params["nc"] * params["H"], causal=params.get("causal", True),
-                                v2=params.get("v2", False))
+                                params["nc"] * params["H"],
+                                params.get("C", KKT_C), params.get("D", KKT_D),
+                                causal=params.get("causal", True), v2=params.get("v2", False))
 
 
 def _kkt_native_v2_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
     k, g_native, beta_native = inputs
     return _gated_qk_run_native(lib, ws, k, k, g_native, beta_native,
-                                params["nc"] * params["H"], causal=False, v2=True)
+                                params["nc"] * params["H"],
+                                params.get("C", KKT_C), params.get("D", KKT_D),
+                                causal=False, v2=True)
 
 
 def _gated_qk_native_v2_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
     a, b, g_native, beta_native = inputs
     return _gated_qk_run_native(lib, ws, a, b, g_native, beta_native,
-                                params["nc"] * params["H"], causal=params.get("causal", True),
-                                v2=True)
+                                params["nc"] * params["H"],
+                                params.get("C", KKT_C), params.get("D", KKT_D),
+                                causal=params.get("causal", True), v2=True)
+
+
+# --------------------------------------------------------------------------- #
+#  qk_prologue — per-dim PROLOGUE: Vec q⊙P / k⊙invP -> matmul-core -> Vec mask.
+#  The per-channel-gate (GLA/KDA) counterpart of gated_qk's scalar epilogue: the
+#  decay rides on the OPERANDS (folded into the load) not a scalar coeff. V1 = three
+#  passes in one launch (dispatch-elim; qd/kinv still round-trip a scratch).
+# --------------------------------------------------------------------------- #
+_pro_exec_argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int32, ctypes.c_int64, ctypes.c_void_p]
+
+
+def _pro_bind(lib: ctypes.CDLL) -> None:
+    lib.pro_setup.restype = ctypes.c_void_p
+    lib.pro_exec.argtypes = _pro_exec_argtypes
+    lib.pro_teardown.argtypes = [ctypes.c_void_p]
+    # V2 (per-tile Vec->Cube->Vec, L2 ring): qd/kinv stay L2 — same ABI, distinct setup.
+    lib.pro_setup_v2.restype = ctypes.c_void_p
+    lib.pro_exec_v2.argtypes = _pro_exec_argtypes
+
+
+def _pro_run(lib, ws, inputs, params, v2=False) -> List[torch.Tensor]:
+    """A = tril((q⊙P) @ (k⊙invP)ᵀ) over all M=nc·H chunks. Inputs in Program order
+    [q, k, P, invP], all [.,C,D] reshaping to [M,C,D]; the kernel keys C/D via -D.
+    ``v2`` selects the L2-resident ring kernel (no full [M,C,D] qd/kinv scratch)."""
+    q, k, P, invP = inputs
+    C, D = params.get("C", KKT_C), params.get("D", KKT_D)
+    M = params["nc"] * params["H"]
+    dev = q.device
+    rs = lambda t: t.reshape(M, C, D).contiguous().half()
+    q_f, k_f, P_f, invP_f = rs(q), rs(k), rs(P), rs(invP)
+    rows = torch.arange(C, device=dev)
+    mask = (rows[:, None] >= rows[None, :]).float().contiguous()      # causal (incl diag)
+    L = torch.zeros(M, C, C, device=dev, dtype=torch.float16)
+    exec_fn = lib.pro_exec_v2 if v2 else lib.pro_exec
+    exec_fn(_vp(q_f), _vp(P_f), _vp(k_f), _vp(invP_f), _vp(mask), ws, _vp(L),
+            ctypes.c_int32(0), ctypes.c_int64(0), _stream())
+    return [L]
+
+
+def _pro_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
+    return _pro_run(lib, ws, inputs, params, v2=False)
+
+
+def _pro_v2_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
+    return _pro_run(lib, ws, inputs, params, v2=True)
+
+
+def _pro_defines(p: dict) -> Dict[str, int]:
+    return {"PRO_NC": p["nc"], "PRO_H": p["H"],
+            "PRO_C": p.get("C", KKT_C), "PRO_D": p.get("D", KKT_D)}
+
+
+def _native_defines(p: dict) -> Dict[str, int]:
+    """-D map keying a native-kkt .so: shape (nc,H) + chunk/head dims (C,D), default
+    128 so GDN/KDA are unchanged; the zoo passes its own C/D to rebuild a distinct .so."""
+    return {"KKT_NC": p["nc"], "KKT_H": p["H"], "KKT_NATIVE": 1,
+            "KKT_C": p.get("C", KKT_C), "KKT_D": p.get("D", KKT_D)}
 
 
 def default_fused_registry() -> FusedKernelRegistry:
@@ -313,7 +379,7 @@ def default_fused_registry() -> FusedKernelRegistry:
     # operands/g/β/L in the Program's own batch layout so there is no transpose bridge.
     reg.register("kkt_gated_native", _Recipe(
         src_dir=_KERNELS, src_file="kkt_fused_lib.cpp",
-        defines=lambda p: {"KKT_NC": p["nc"], "KKT_H": p["H"], "KKT_NATIVE": 1},
+        defines=_native_defines,
         setup_sym="kkt_setup", teardown_sym="kkt_teardown",
         bind=_kkt_bind, launch=_kkt_native_launch,
         contract=FusedContract(
@@ -321,10 +387,10 @@ def default_fused_registry() -> FusedKernelRegistry:
             in_dtypes=[torch.float16, torch.float32, torch.float16],
             out_names=["L"], out_dtype=torch.float16,
             notes="native [M,C,D] kkt (k@kᵀ, real beta, strict-lower); no layout "
-                  "bridge; C=D=128; k [M,C,D], g/beta [M,C]")))
+                  "bridge; C,D via -DKKT_C/-DKKT_D (default 128); k [M,C,D], g/beta [M,C]")))
     reg.register("gated_qk_native", _Recipe(
         src_dir=_KERNELS, src_file="kkt_fused_lib.cpp",
-        defines=lambda p: {"KKT_NC": p["nc"], "KKT_H": p["H"], "KKT_NATIVE": 1},
+        defines=_native_defines,
         setup_sym="kkt_setup", teardown_sym="kkt_teardown",
         bind=_kkt_bind, launch=_gated_qk_native_launch,
         contract=FusedContract(
@@ -332,29 +398,57 @@ def default_fused_registry() -> FusedKernelRegistry:
             in_dtypes=[torch.float16, torch.float16, torch.float32, torch.float16],
             out_names=["L"], out_dtype=torch.float16,
             notes="native [M,C,D] a@bᵀ + gated/masked epilogue; no layout bridge; "
-                  "chunk_o Aqk = (q,k,beta=1,causal); C=D=128; a,b [M,C,D], g/beta [M,C]")))
+                  "chunk_o Aqk = (q,k,beta=1,causal); C,D via -DKKT_C/-DKKT_D "
+                  "(default 128); a,b [M,C,D], g/beta [M,C]")))
     # V2: native kernels with per-tile FFTS interleave (kkt_setup_v2 ring buffer) —
     # removes the kernel's own qk HBM round-trip, the residual vs the megakernel.
     reg.register("kkt_gated_native_v2", _Recipe(
         src_dir=_KERNELS, src_file="kkt_fused_lib.cpp",
-        defines=lambda p: {"KKT_NC": p["nc"], "KKT_H": p["H"], "KKT_NATIVE": 1},
+        defines=_native_defines,
         setup_sym="kkt_setup_v2", teardown_sym="kkt_teardown",
         bind=_kkt_bind, launch=_kkt_native_v2_launch,
         contract=FusedContract(
             in_slots=["k", "g_native", "beta_native"],
             in_dtypes=[torch.float16, torch.float32, torch.float16],
             out_names=["L"], out_dtype=torch.float16,
-            notes="native kkt + per-tile interleave (no qk round-trip); C=D=128")))
+            notes="native kkt + per-tile interleave (no qk round-trip); "
+                  "C,D via -DKKT_C/-DKKT_D (default 128)")))
     reg.register("gated_qk_native_v2", _Recipe(
         src_dir=_KERNELS, src_file="kkt_fused_lib.cpp",
-        defines=lambda p: {"KKT_NC": p["nc"], "KKT_H": p["H"], "KKT_NATIVE": 1},
+        defines=_native_defines,
         setup_sym="kkt_setup_v2", teardown_sym="kkt_teardown",
         bind=_kkt_bind, launch=_gated_qk_native_v2_launch,
         contract=FusedContract(
             in_slots=["a", "b", "g_native", "beta_native"],
             in_dtypes=[torch.float16, torch.float16, torch.float32, torch.float16],
             out_names=["L"], out_dtype=torch.float16,
-            notes="native a@bᵀ + per-tile interleave (no qk round-trip); C=D=128")))
+            notes="native a@bᵀ + per-tile interleave (no qk round-trip); "
+                  "C,D via -DKKT_C/-DKKT_D (default 128)")))
+    # Per-dim PROLOGUE (GLA/KDA): operand prescale q⊙P / k⊙invP folded into one launch
+    # ahead of the matmul-core, then a causal/tril mask. The per-channel-gate twin of
+    # gated_qk's scalar epilogue. V1: dispatch-elim (qd/kinv round-trip a scratch).
+    reg.register("qk_prologue", _Recipe(
+        src_dir=_KERNELS, src_file="prologue_fused_lib.cpp",
+        defines=_pro_defines,
+        setup_sym="pro_setup", teardown_sym="pro_teardown",
+        bind=_pro_bind, launch=_pro_launch,
+        contract=FusedContract(
+            in_slots=["q", "k", "P", "invP"],
+            in_dtypes=[torch.float16, torch.float16, torch.float16, torch.float16],
+            out_names=["L"], out_dtype=torch.float16,
+            notes="per-dim prologue: tril((q⊙P)@(k⊙invP)ᵀ); per-channel gate (GLA/KDA); "
+                  "C,D via -DPRO_C/-DPRO_D; q/k/P/invP [M,C,D], L [M,C,C]")))
+    reg.register("qk_prologue_v2", _Recipe(
+        src_dir=_KERNELS, src_file="prologue_fused_lib.cpp",
+        defines=_pro_defines,
+        setup_sym="pro_setup_v2", teardown_sym="pro_teardown",
+        bind=_pro_bind, launch=_pro_v2_launch,
+        contract=FusedContract(
+            in_slots=["q", "k", "P", "invP"],
+            in_dtypes=[torch.float16, torch.float16, torch.float16, torch.float16],
+            out_names=["L"], out_dtype=torch.float16,
+            notes="per-dim prologue, L2-resident ring (Vec prescale->Cube matmul from "
+                  "slot->Vec mask); qd/kinv never hit HBM; C,D via -DPRO_C/-DPRO_D")))
     return reg
 
 
