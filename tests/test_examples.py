@@ -14,6 +14,7 @@ EXAMPLE_MODULES = [
     "attention.vanilla_la", "attention.retnet", "attention.gla", "attention.mamba2",
     "attention.gdn", "attention.kda",
     "workflow.read_modes", "workflow.graph_capture", "workflow.fusion_decision",
+    "workflow.fusion_regions",
     "benchmarks.gdn_features", "benchmarks._mega_bench",
     "benchmarks.gdn_mega", "benchmarks.kda_mega",
 ]
@@ -87,25 +88,23 @@ def test_select_prologue_kernel_shape_gate():
     assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue_v2" for n in big.nodes)
 
 
-def test_kda_qk_prologue_transform():
-    """The AbsorbQKPrologue transform rewrites KDA chunk_o's intra score into the
-    per-dim qk_prologue FusedNode (the per-channel analog of GDN's scalar gated_qk
-    epilogue) over qF/kF and the exp(±g) coefficients; same output. Shape gate picks
-    V2 at C=D=128; v2=False forces V1; the canonical program has no prologue node."""
-    from pto_fuser import FusedNode
-    from pto_fuser.transforms import AbsorbQKPrologue
+def test_kda_qk_prologue_template():
+    """The generator emits KDA chunk_o's intra score as the per-dim qk_prologue
+    FusedNode (PerDimPrologueTemplate) over qF/kF and the exp(±g) coefficients. Shape
+    gate picks V2 at C=D=128; v2=False forces V1; canonical has no prologue node."""
+    from pto_fuser import FusedNode, FuseContractionEpilogue
     from attention._kda_full import build_kda_program
     B, H, nc, C, D = 1, 4, 2, 128, 128
     canon = build_kda_program(B, H, nc, C, D, D ** -0.5)
     assert not any(isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")
                    for n in canon.nodes)                        # canonical: no prologue
-    prog = AbsorbQKPrologue(B, H, nc, C, D).apply(canon).program
+    prog = FuseContractionEpilogue(B, H, nc, C, D).apply(canon).program
     assert prog.outputs == ["o"]
     pro = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("qk_prologue")]
     assert len(pro) == 1 and pro[0].outputs == ["Aqk_c"]
     assert pro[0].inputs == ["qF", "kF", "coef_ag", "coef_bg"]
     assert pro[0].kernel == "qk_prologue_v2"                    # C·D = 16384 -> win regime
-    v1 = AbsorbQKPrologue(B, H, nc, C, D, v2=False).apply(canon).program
+    v1 = FuseContractionEpilogue(B, H, nc, C, D, v2=False).apply(canon).program
     assert any(isinstance(n, FusedNode) and n.kernel == "qk_prologue" for n in v1.nodes)
 
 
@@ -146,37 +145,25 @@ def test_gdn_resident_scan_transform():
     assert len(fn) == 1 and "perdim_decay" not in fn[0].params      # GDN = scalar decay
 
 
-def test_gdn_gated_kkt_transform():
-    """AbsorbGatedKKT rewrites the kkt einsum+coefA mul+tril into kkt_gated_native
-    (native [M,C,D], no transpose bridge); v2 selects the FFTS-interleave kernel."""
-    from pto_fuser import FusedNode, TensorOp
-    from pto_fuser.transforms import AbsorbGatedKKT
+def test_gdn_gated_templates_emit():
+    """The generator emits GDN's kkt and chunk_o contractions as their proven native
+    gated-matmul kernels (kkt_gated_native / gated_qk_native, no transpose bridge);
+    v2 selects the FFTS-interleave kernels."""
+    from pto_fuser import FusedNode, TensorOp, FuseContractionEpilogue
     from attention._gdn_full import build_gdn_program
     B, H, nc, C, D = 1, 4, 2, 128, 128
     canon = build_gdn_program(B, H, nc, C, D, D ** -0.5)
-    prog = AbsorbGatedKKT(nc, H).apply(canon).program
-    kkt = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("kkt_gated_native")]
+    prog = FuseContractionEpilogue(B, H, nc, C, D).apply(canon).program
+    kkt = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel == "kkt_gated_native"]
+    qk = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel == "gated_qk_native"]
     assert len(kkt) == 1 and kkt[0].outputs == ["A"]
     assert kkt[0].inputs == ["kF", "g_native", "beta_native"]
-    assert kkt[0].kernel == "kkt_gated_native"                        # v1 default
-    assert not any(isinstance(n, TensorOp) and n.output == "k_kkt" for n in prog.nodes)
-    v2 = AbsorbGatedKKT(nc, H, v2=True).apply(canon).program
-    assert any(isinstance(n, FusedNode) and n.kernel == "kkt_gated_native_v2" for n in v2.nodes)
-
-
-def test_gdn_gated_chunk_o_transform():
-    """AbsorbGatedChunkO rewrites chunk_o's Aqk einsum+coef_o mul+contiguous into the
-    native gated_qk FusedNode (q@kᵀ + on-chip gate/causal-mask epilogue, β=1)."""
-    from pto_fuser import FusedNode
-    from pto_fuser.transforms import AbsorbGatedChunkO
-    from attention._gdn_full import build_gdn_program
-    B, H, nc, C, D = 1, 4, 2, 128, 128
-    canon = build_gdn_program(B, H, nc, C, D, D ** -0.5)
-    prog = AbsorbGatedChunkO(nc, H).apply(canon).program
-    qk = [n for n in prog.nodes if isinstance(n, FusedNode) and n.kernel.startswith("gated_qk_native")]
-    assert len(qk) == 1 and qk[0].outputs == ["Aqk_c"]
+    assert len(qk) == 1 and qk[0].outputs == ["Aqk_c"] and qk[0].params.get("causal") is True
     assert qk[0].inputs == ["qF", "kF", "g_native", "beta_native_ones"]
-    assert qk[0].params.get("causal") is True
+    assert not any(isinstance(n, TensorOp) and n.output == "k_kkt" for n in prog.nodes)
+    v2 = FuseContractionEpilogue(B, H, nc, C, D, v2=True).apply(canon).program
+    v2k = {n.kernel for n in v2.nodes if isinstance(n, FusedNode)}
+    assert v2k == {"kkt_gated_native_v2", "gated_qk_native_v2"}
 
 
 def test_kda_perdim_scan_transform():

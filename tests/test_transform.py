@@ -7,10 +7,8 @@ inserts the expected FusedNode, is idempotent, and leaves a valid Program.
 import pytest
 
 from pto_fuser import (EinsumNode, FusedNode, canonicalize, EnableDirectReads,
-                       EnableFusedStore)
-from pto_fuser.transforms import (AbsorbGatedChunkO, AbsorbGatedKKT,
-                                  AbsorbQKPrologue, LowerPerDimScan,
-                                  LowerResidentScan)
+                       EnableFusedStore, FuseContractionEpilogue)
+from pto_fuser.transforms import LowerPerDimScan, LowerResidentScan
 
 
 def _gdn():
@@ -66,20 +64,20 @@ def test_perdim_scan_matches_kda_not_gdn():
     assert LowerPerDimScan(1, 4, 2, 128, 128).match(_gdn()) == 0
 
 
-def test_gated_kkt_matches_gdn_not_kda():
-    # GDN kkt is k·kᵀ (same operand); KDA kkt is a_op·b_op — no self-outer-product.
-    assert AbsorbGatedKKT(2, 4).match(_gdn()) == 1
-    assert AbsorbGatedKKT(2, 4).match(_kda()) == 0
+def test_generator_matches_both_forwards():
+    # GDN: kkt (k·kᵀ) + chunk_o (q·kᵀ) both match proven templates
+    assert FuseContractionEpilogue(1, 4, 2, 128, 128).match(_gdn()) == 2
+    # KDA: only chunk_o (per-dim prologue) matches; kkt stays a plain einsum
+    assert FuseContractionEpilogue(1, 4, 2, 128, 128).match(_kda()) == 1
 
 
-def test_gated_chunk_o_matches_gdn_not_kda():
-    assert AbsorbGatedChunkO(2, 4).match(_gdn()) == 1
-    assert AbsorbGatedChunkO(2, 4).match(_kda()) == 0
-
-
-def test_qk_prologue_matches_kda_not_gdn():
-    assert AbsorbQKPrologue(1, 4, 2, 128, 128).match(_kda()) == 1
-    assert AbsorbQKPrologue(1, 4, 2, 128, 128).match(_gdn()) == 0
+def test_generator_emits_proven_kernels():
+    gdn = FuseContractionEpilogue(1, 4, 2, 128, 128).apply(canonicalize(_gdn())).program
+    assert {n.kernel for n in gdn.nodes if isinstance(n, FusedNode)} \
+        == {"kkt_gated_native", "gated_qk_native"}
+    kda = FuseContractionEpilogue(1, 4, 2, 128, 128).apply(canonicalize(_kda())).program
+    kk = {n.kernel for n in kda.nodes if isinstance(n, FusedNode)}
+    assert len(kk) == 1 and next(iter(kk)).startswith("qk_prologue")   # shape-gates v1/v2
 
 
 def test_resident_scan_idempotent_and_valid():
@@ -95,8 +93,7 @@ def test_resident_scan_idempotent_and_valid():
 def test_transforms_compose_into_valid_program():
     canon = canonicalize(_gdn())
     prog = LowerResidentScan(1, 4, 2, 128, 128).apply(canon).program
-    prog = AbsorbGatedKKT(2, 4).apply(prog).program
-    prog = AbsorbGatedChunkO(2, 4).apply(prog).program
+    prog = FuseContractionEpilogue(1, 4, 2, 128, 128).apply(prog).program
     kernels = {n.kernel for n in prog.nodes if isinstance(n, FusedNode)}
     assert kernels == {"chunk_h_scan", "kkt_gated_native", "gated_qk_native"}
     assert prog.outputs == ["o"]                  # still produces the forward output

@@ -1,16 +1,12 @@
 """Structural (forward-shaped) transforms.
 
-The universal read-mode / fused-store transforms live in `pto_fuser.transform`;
-this package holds the transforms that match a *structural pattern* in a chunked
-recurrence and rewrite it into a hosted fused kernel — resident-state scan and
-glue absorption. Each is a pure `Program -> Program` rewrite parameterized by the
-forward's dims (the way a `cce-mlir` pass is parameterized by its options), matching
-the canonical (all-staged) program the builders emit and the verifier gates against.
+The universal read-mode / fused-store transforms live in `pto_fuser.transform`; the
+region-driven contraction+epilogue generator lives in `pto_fuser.template`. This
+package holds the **resident-state scan** rewrites — the recurrence family, which is
+not a contraction+epilogue template: a pure `Program -> Program` rewrite parameterized
+by the forward's dims, matching the canonical (all-staged) scan the builders emit.
 """
-from .gdn import (AbsorbGatedChunkO, AbsorbGatedKKT, LowerResidentScan)
-from .kda import (AbsorbQKPrologue, LowerPerDimScan)
+from .gdn import LowerResidentScan
+from .kda import LowerPerDimScan
 
-__all__ = [
-    "LowerResidentScan", "AbsorbGatedKKT", "AbsorbGatedChunkO",
-    "LowerPerDimScan", "AbsorbQKPrologue",
-]
+__all__ = ["LowerResidentScan", "LowerPerDimScan"]

@@ -129,7 +129,7 @@ def prepare_gdn_bindings(q, k, v, beta, g_in, work=torch.float16) -> dict:
     # native [M,C] gate operands (heads outer, the Program's own batch) for the
     # scalar-gated glue-absorption FusedNodes (kkt_gated_native / gated_qk_native) —
     # no transpose, just g_sum/β reshaped to match flat(kF). Consumed only after the
-    # absorb-gated-kkt / absorb-gated-chunk-o transforms fire; declared as Program
+    # fuse-contraction-epilogue generator fires (kkt/chunk_o templates); declared as Program
     # inputs so those rewrites validate.
     nat = lambda t, dt: t.reshape(M, C).to(dt).contiguous()
 

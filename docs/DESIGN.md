@@ -208,7 +208,7 @@ program without it stands.
   exposes the fused permuted store when free1 is innermost (drops Phase C; 3.6–3.9× on
   `->bsht`, 2.11× when the swap fires).
 
-### Structural (forward-shaped fusions, `transforms/gdn.py` + `transforms/kda.py`)
+### Structural — resident-state scan (`transforms/gdn.py` + `transforms/kda.py`)
 
 - **`lower-resident-scan`** (GDN) / **`lower-perdim-scan`** (KDA) — replace the unrolled
   `nc`-chunk cross-chunk scan (which writes the carried state `S` back to HBM every
@@ -216,24 +216,22 @@ program without it stands.
   parallel `v_new = U − W·h_out` recompute. Removes the per-chunk HBM round-trip of `S` —
   a bandwidth win graph capture cannot touch, so it fuses **broadly** (4.40× at B1H4nc8,
   2.28× at B8H32nc16), not just launch-bound. KDA differs only in a per-dimension decay
-  vector (`perdim_decay=True`, an `[B,H,nc,D]` operand).
-- **`absorb-gated-kkt`** / **`absorb-gated-chunk-o`** (GDN) — match the
-  `(a·bᵀ) einsum → mul(coef) → tril? → contiguous` region and replace it with a native
-  gated-qk `FusedNode` (matmul-core + on-chip gate/mask epilogue) so the qk matrix never
-  lands in HBM. The scalar-gated epilogue is shared across the family (vanilla LA,
-  RetNet, Mamba-2, GDN all differ only in the host `g`/`β`). The native `[M,C,D]`
-  variants read the program's own batch with no transpose bridge; the v2 kernels
-  additionally keep the qk tile L2-resident (no `[M,C,C]` round-trip) — measured kkt
-  1.18–1.20×.
-- **`absorb-qk-prologue`** (KDA) — the per-**channel** analog: KDA's gate is baked into
-  the operands (`exp(±g)`), so the decay folds into the matmul *load* (`q⊙exp(g)`,
-  `k⊙exp(−g)`) rather than a scalar score factor, and the causal mask rides in the
-  kernel's Vec pass. `q_eff` is left in place (it also feeds `o_inter`).
+  vector (`perdim_decay=True`, an `[B,H,nc,D]` operand). Each matches only its own family
+  and is idempotent; the rewrite is byte-identical to the hand-written fused lowering.
 
-Each structural transform matches only its own family (a GDN-vs-KDA discriminator on the
-program's declared coefficient inputs and the self-outer-product vs prescaled-operand
-einsum shape), is idempotent (it does not re-fire on an already-fused program), and its
-rewrite is proven byte-identical to the previously hand-written fused lowering.
+### Structural — contraction+epilogue template emission (`template.py`, §8)
+
+- **`fuse-contraction-epilogue`** — the region-driven generator. For each contraction it
+  extracts the local **epilogue unit** (einsum + downstream single-consumer glue chain +
+  per-operand prologue) and, if a **proven** `Template` matches, rewrites the unit into
+  that template's `FusedNode`. The template registry hosts the hand-proved gated-matmul
+  kernels: `kkt-gated-native` (`A = tril((k·kᵀ)⊙coef,-1)`), `chunk-o-gated-native`
+  (`(q·kᵀ)⊙coef`, causal), and `qk-prologue` (KDA per-dim gate folded into the matmul
+  load). The native `[M,C,D]` variants read the program's own batch (no transpose
+  bridge); the v2 kernels keep the qk tile L2-resident (no `[M,C,C]` round-trip). One
+  generator replaces three bespoke transforms — it is byte-identical to them (golden
+  test) — and **never emits a pattern without a proven kernel**: a contraction whose
+  epilogue matches no template is left staged (`epilogue_report` says which and why).
 
 ---
 
@@ -276,16 +274,38 @@ each gated by the §5 discipline and each new fused pattern hand-proven by a pro
 **before** it is generalized into a generator (the generator never emits an unproven
 pattern):
 
-1. **Fusion-region identification** — a transform that *annotates* maximal einsum+glue
-   producer-consumer chains where the intermediate is the dominant HBM traffic, and
-   estimates the L2-residency win. Analysis only, no codegen; validated by having it
-   rediscover the regions the current structural transforms already fuse.
-2. **Template emission for the hardware-clean class** — generate exactly the pattern the
-   Ascend a2/a3 hardware supports without landmines: matmul-core + per-channel (1D)
-   fixpipe epilogue (the scalar-gate absorption that *is* fixpipe-expressible),
-   parameterized from a region, every emission gated by the verifier. Deliberately
-   excludes 2D-mask-in-fixpipe and speculative on-chip Cube↔Vec datapaths (the Cube↔Vec
-   exchange is physically GM-only on this hardware).
+1. **Fusion-region identification** — **realized** (`analysis.py`,
+   `identify_fusion_regions`). An *analysis* (not a rewrite) that partitions the
+   canonical program into maximal fusible scopes cut at opaque-kernel boundaries, sizes
+   every intermediate by a pure meta-tensor shape walk (no device), and scores each
+   region by the internal HBM traffic fusing it would keep on-chip (the L2-residency
+   opportunity — e.g. GDN splits into a 4-node contraction-epilogue region + a ~126-node
+   recurrence region across the tri_inv cut, ~151 MB fusible on-chip). Emits nothing.
+   Validated (`test_analysis.py`) that it rediscovers the regions the structural
+   transforms already fuse and that a key safety property holds: **every structural
+   transform stays inside a single region — a fusion never spans the tri_inv boundary.**
+   The region representation (named analysis; explicit boundary-in / boundary-out /
+   internal sets) is deliberately compiler-shaped so it maps onto a `cce-mlir`
+   fusion/outlining analysis when this stack is reimplemented there.
+2. **Template emission from a region** — **realized** (`template.py`,
+   `FuseContractionEpilogue`). For each contraction the generator extracts its epilogue
+   unit and, if a **proven** kernel template matches, emits that `FusedNode` — one
+   region-driven generator replacing the three bespoke gated-fusion transforms
+   (byte-identical to them; `test_template.py`), **never emitting a pattern without a
+   proven kernel behind it**. `epilogue_report` classifies every contraction's epilogue.
+
+   *Evidence that reshaped this step:* §8 originally named the per-channel (1D) *fixpipe*
+   scale epilogue as the first class to generate (it is the one a matmul store can absorb
+   without a Vec pass). But `pto-einsum` exposes no matmul+scale epilogue (a scaled
+   matmul is einsum + a Vec op today), and — measured by `epilogue_report` on the real
+   forwards — **no GDN/KDA stage is a pure fixpipe-1D scale**: their epilogues are 2D
+   score masks and per-row scales, which the *Vec*-epilogue templates already cover. So
+   the proven template family we generalize is matmul-core + on-chip Vec/mask epilogue;
+   a fixpipe-1D kernel would have no consumer and is deferred (hand-prove it when a
+   consumer appears, or expose it as a `pto-einsum` core capability) rather than built
+   speculatively. This keeps the discipline: the generator only ever emits proven kernels.
+   Still excluded, by the physical Cube↔Vec GM-only constraint: 2D-mask-in-fixpipe and
+   speculative on-chip Cube↔Vec datapaths.
 3. **Widen the template class one proven pattern at a time** — per-tile FFTS interleave,
    then cube+vec mix kernels, then 2D-mask Vec passes — each hand-prototyped and gated
    first, then folded into the generator. Mix kernels with FFTS come only after the

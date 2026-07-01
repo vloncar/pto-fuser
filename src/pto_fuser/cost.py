@@ -102,11 +102,12 @@ class CostModel:
             # B1H4nc8, 2.28× at B8H32nc16).
             return Prediction(1.0 + 0.05 * feat.nc,
                               f"resident state removes {feat.nc} per-chunk S round-trips")
-        if name in ("absorb-gated-kkt", "absorb-gated-chunk-o", "absorb-qk-prologue"):
-            # Glue-absorption keeps the qk matrix on-chip; the glue share grows with
-            # head count (large-H captured forward is glue-bound), so the win rises
-            # with H. v2 (L2-resident, no [M,C,C] round-trip) pays where the score/head
-            # product is large.
+        if name == "fuse-contraction-epilogue":
+            # Region-driven glue absorption (contraction + epilogue -> one gated-matmul
+            # kernel): keeps the qk matrix on-chip; the glue share grows with head count
+            # (large-H captured forward is glue-bound), so the win rises with H. v2
+            # (L2-resident, no [M,C,C] round-trip) pays where the score/head product is
+            # large.
             v2 = feat.C * feat.D >= 4096
             return Prediction(0.3 + 0.03 * feat.H,
                               "glue absorption keeps qk on-chip (glue-bound at large H)",

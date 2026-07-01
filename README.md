@@ -29,6 +29,12 @@ lever is adding a rewrite + a cost prediction, not threading a build flag.
   - `fusion.py` / `planner.py` — the verification primitives (`decide`, per-node
     read-mode measurement) the driver reuses; `kernels/` — the hosted device kernels;
     `forwards/` — the DeltaNet reference + fused-stage head-to-heads.
+  - `analysis.py` / `template.py` — the steps toward megakernel generation
+    (DESIGN.md §8): `identify_fusion_regions` (device-free analysis that partitions the
+    program into fusible scopes cut at opaque boundaries and scores each by the on-chip
+    HBM traffic fusing it would save), and `FuseContractionEpilogue` (the region-driven
+    generator that emits a contraction+epilogue as a *proven* gated-matmul kernel from a
+    template registry — never a pattern without a proven kernel; `epilogue_report`).
 - `examples/` — runnable demonstrations: a minimal program, the chunked-attention zoo
   (vanilla LA, RetNet, GLA, Mamba-2, GDN, KDA), one demo per feature (`workflow/`), the
   full `compile_program` forward (`attention/gdn.py`), and the fuser-vs-megakernel
