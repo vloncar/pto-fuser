@@ -25,6 +25,25 @@ from .ir import (EinsumNode, FusedNode, OpaqueNode, Program, TensorOp,
 from .registry import OpaqueRegistry, default_registry
 
 
+_TRIL_MASK_CACHE: Dict[tuple, torch.Tensor] = {}
+
+
+def _tril_mask(rows: int, cols: int, diagonal: int, device, dtype) -> torch.Tensor:
+    """Cached lower-triangular {0,1} mask over the last two dims, built with an
+    arange-compare rather than ``torch.tril``. ``torch.tril`` is pathologically slow on
+    NPU (measured 12-37x a plain mask-multiply — 1.7ms vs 0.05ms for a [16384,16,16]
+    score), so the staged mask uses a broadcast multiply instead. Numerically identical
+    for finite inputs (upper triangle -> 0·x = 0; lower triangle -> 1·x = x)."""
+    key = (rows, cols, diagonal, device, dtype)
+    m = _TRIL_MASK_CACHE.get(key)
+    if m is None:
+        r = torch.arange(rows, device=device).unsqueeze(1)
+        c = torch.arange(cols, device=device).unsqueeze(0)
+        m = (c <= r + diagonal).to(dtype)
+        _TRIL_MASK_CACHE[key] = m
+    return m
+
+
 @contextlib.contextmanager
 def library_modes(read_mode: str = "auto", fuse_out: bool = True):
     """Drive the library's documented lowering toggles for one einsum build.
@@ -123,7 +142,9 @@ class StagedExecutor:
         op, p = node.op, node.params
         ins = [env[n].float() for n in node.inputs]         # accumulate in fp32
         if op == "tril":
-            out = torch.tril(ins[0], diagonal=p.get("diagonal", 0))
+            x = ins[0]
+            mask = _tril_mask(x.shape[-2], x.shape[-1], p.get("diagonal", 0), x.device, x.dtype)
+            out = x * mask
         elif op == "add":
             out = ins[0] + ins[1]
         elif op == "sub":
