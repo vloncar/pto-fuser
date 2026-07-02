@@ -114,3 +114,26 @@ def test_chunk_o_flash_transform():
     assert not any(isinstance(n, EinsumNode) and n.output in ("Aqk", "o_intra")
                    for n in prog.nodes)
     assert t.match(prog) == 0                        # idempotent
+
+
+def test_perdim_chunk_o_flash_transform():
+    """FusePerDimChunkOFlash fuses KDA's per-dim chunk_o (q_eff/k_eff prescale muls +
+    Aqk einsum + tril + contiguous + o_intra) into ONE qkvp_flash_native_v2 node; it
+    matches the per-dim gate (not GDN's scalar chunk_o) and keeps q_eff (feeds o_inter)
+    while dropping the exclusive k_eff."""
+    from pto_fuser import EinsumNode, FusedNode, FusePerDimChunkOFlash
+    kda = _kda()
+    t = FusePerDimChunkOFlash(1, 4, 2, 128, 128)
+    assert t.match(kda) == 1
+    assert t.match(_gdn()) == 0                       # scalar chunk_o -> no per-dim match
+    prog = t.apply(kda).program
+    flash = [n for n in prog.nodes if isinstance(n, FusedNode)
+             and n.kernel == "qkvp_flash_native_v2"]
+    assert len(flash) == 1
+    assert flash[0].outputs == ["o_intra"]
+    assert flash[0].inputs == ["qF", "kF", "vn_flat", "coef_ag", "coef_bg"]
+    assert not any(isinstance(n, EinsumNode) and n.output in ("Aqk", "o_intra")
+                   for n in prog.nodes)
+    assert not any(getattr(n, "output", None) == "k_eff" for n in prog.nodes)   # dropped
+    assert any(getattr(n, "output", None) == "q_eff" for n in prog.nodes)       # kept
+    assert t.match(prog) == 0                         # idempotent

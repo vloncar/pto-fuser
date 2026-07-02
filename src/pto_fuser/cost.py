@@ -120,6 +120,12 @@ class CostModel:
             # Propose it (the verifier keeps it where dispatch dominates, drops it under
             # capture); the standalone transform means a drop never disturbs the kkt fusion.
             return Prediction(0.2, "chunk_o score→output in one launch (dispatch-regime win)")
+        if name == "fuse-perdim-chunk-o-flash":
+            # Per-dim (KDA/GLA) chunk_o score→output fused: Vec prescale → Cube score →
+            # Vec tril → Cube A·v, ops+S+A L2-resident. The double-buffered V2 hides the
+            # 4-stage handshake, so (like the scalar flash) it is a kept captured win at
+            # large head count and disposed where there are too few tiles to overlap.
+            return Prediction(0.2, "per-dim chunk_o score→output in one launch (L2-resident)")
         if name == "fuse-contraction-epilogue":
             # Region-driven glue absorption (contraction + epilogue -> one gated-matmul
             # kernel): keeps the qk matrix on-chip; the glue share grows with head count

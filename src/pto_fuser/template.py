@@ -332,6 +332,71 @@ class FuseChunkOFlash(Transform):
         return TransformResult(prog, True, 1, "emitted qkv_flash_native")
 
 
+class FusePerDimChunkOFlash(Transform):
+    """Per-dim (KDA/GLA) chunk_o flash — the per-channel-gate twin of `FuseChunkOFlash`.
+    Matches the canonical per-dim score→output chain: ``q_eff=mul(qF,coef_ag)`` and
+    ``k_eff=mul(kF,coef_bg)`` feeding the Aqk einsum → ``tril`` → contiguous → the
+    o_intra ``nij,nje->nie`` contraction, and replaces it with ONE ``qkvp_flash_native_v2``
+    kernel (Vec prescale → Cube score → Vec tril → Cube A·v, ops+S+A L2-resident).
+    ``q_eff`` is kept (it also feeds o_inter); ``k_eff`` is dropped when exclusive. Reads
+    (qF, kF, v, coef_ag, coef_bg) — the decay rides on the operands, not a scalar coeff.
+    Standalone + independently verified, exactly like the scalar flash."""
+
+    name = "fuse-perdim-chunk-o-flash"
+    summary = "per-dim chunk_o prescale·q·kᵀ → tril → ·v -> one qkvp_flash_native_v2"
+
+    def __init__(self, B, H, nc, C, D) -> None:
+        self.dims = Dims(B, H, nc, C, D)
+
+    def _site(self, program: Program) -> Optional[Tuple[int, EpilogueUnit, int]]:
+        """(anchor_idx, unit, o_intra_idx) for the per-dim chunk_o chain, else None."""
+        for i, n in enumerate(program.nodes):
+            if not (isinstance(n, EinsumNode) and n.equation == "nid,njd->nij"):
+                continue
+            unit = extract_epilogue_unit(program, i)
+            a, b = unit.anchor.inputs
+            pa, pb = unit.prologue.get(a), unit.prologue.get(b)
+            if not (pa and pb):
+                continue
+            if not (pa[1] == ["qF", "coef_ag"] and pb[1] == ["kF", "coef_bg"]
+                    and unit.epilogue_ops == ["tril", "contiguous"]):
+                continue
+            c = _single_consumer(program, unit.boundary_out)
+            if c is None:
+                continue
+            cn = program.nodes[c]
+            if (isinstance(cn, EinsumNode) and cn.equation == "nij,nje->nie"
+                    and cn.inputs[0] == unit.boundary_out):
+                return i, unit, c
+        return None
+
+    def match(self, program: Program) -> int:
+        return 1 if self._site(program) is not None else 0
+
+    def apply(self, program: Program) -> TransformResult:
+        site = self._site(program)
+        if site is None:
+            return TransformResult(program, False, 0, "no per-dim chunk_o score→output chain")
+        i, unit, c = site
+        o_intra = program.nodes[c]
+        v_name = o_intra.inputs[1]
+        node = FusedNode(kernel="qkvp_flash_native_v2",
+                         inputs=["qF", "kF", v_name, "coef_ag", "coef_bg"],
+                         outputs=[o_intra.output],
+                         params={"nc": self.dims.nc, "H": self.dims.H, "C": self.dims.C,
+                                 "D": self.dims.D, "DV": self.dims.D, "causal": True},
+                         subsumes=["chunk_o k_eff mul + Aqk einsum + tril + contiguous + "
+                                   "o_intra A@v (masked score never in HBM)"])
+        drop = {i} | {j for j, _ in unit.epilogue} | {c}
+        # k_eff (b's prescale mul) is exclusive to this unit -> drop it; q_eff feeds o_inter.
+        b = unit.anchor.inputs[1]
+        kmul = unit.prologue[b][0]
+        if _single_consumer(program, program.nodes[kmul].output) == i:
+            drop.add(kmul)
+        prog = splice(program, drop, min(drop), [node])
+        return TransformResult(prog, True, 1, "emitted qkvp_flash_native_v2")
+
+
 # --------------------------------------------------------------------------- #
 #  reporting (which epilogues are template-eligible; the fixpipe-1D finding)
 # --------------------------------------------------------------------------- #

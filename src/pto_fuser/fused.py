@@ -395,6 +395,52 @@ def _qkv_v2_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
     return _qkv_run(lib, ws, inputs, params, v2=True)
 
 
+# --------------------------------------------------------------------------- #
+#  qkvp_flash — PER-DIM chunk_o flash (KDA/GLA). The per-channel-gate twin of
+#  qkv_flash: the decay rides on the OPERANDS (a Vec prescale q⊙coef_ag, k⊙coef_bg)
+#  ahead of the score matmul, then a plain tril, then A·v — Vec→Cube→Vec→Cube in one
+#  launch, ops+S+A all L2-resident. V2 is the double-buffered interleave (emitted); V1
+#  is the four-pass bit-exact oracle.
+# --------------------------------------------------------------------------- #
+def _qkvp_bind(lib: ctypes.CDLL) -> None:
+    _exec_args = [ctypes.c_void_p] * 6 + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    lib.qkvp_setup.restype = ctypes.c_void_p
+    lib.qkvp_setup_v2.restype = ctypes.c_void_p
+    lib.qkvp_exec.argtypes = _exec_args
+    lib.qkvp_exec_v2.argtypes = _exec_args
+    lib.qkvp_teardown.argtypes = [ctypes.c_void_p]
+
+
+def _qkvp_run(lib, ws, inputs, params, v2=False) -> List[torch.Tensor]:
+    """o = tril((q⊙coef_ag)·(k⊙coef_bg)ᵀ) · v over all M=nc·H chunks, one launch.
+    Inputs (Program order) [q, k, v, coef_ag, coef_bg]; q/k [.,C,D], v [.,C,DV],
+    coef_ag/coef_bg [.,C,D] (per-dim exp(±g)). Output o [M,C,DV] fp32."""
+    q, k, v, coef_ag, coef_bg = inputs
+    C, D = params.get("C", KKT_C), params.get("D", KKT_D)
+    DV = params.get("DV", D)
+    M = params["nc"] * params["H"]
+    dev = q.device
+    q_f = q.reshape(M, C, D).contiguous().half()
+    k_f = k.reshape(M, C, D).contiguous().half()
+    v_f = v.reshape(M, C, DV).contiguous().half()
+    ag = coef_ag.reshape(M, C, D).contiguous().half()
+    bg = coef_bg.reshape(M, C, D).contiguous().half()
+    rows = torch.arange(C, device=dev)
+    mask = (rows[:, None] >= rows[None, :]).float().contiguous()      # causal incl diag
+    o = torch.zeros(M, C, DV, device=dev, dtype=torch.float32)
+    exec_fn = lib.qkvp_exec_v2 if v2 else lib.qkvp_exec
+    exec_fn(_vp(q_f), _vp(ag), _vp(k_f), _vp(bg), _vp(mask), _vp(v_f), ws, _vp(o), _stream())
+    return [o]
+
+
+def _qkvp_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
+    return _qkvp_run(lib, ws, inputs, params, v2=False)
+
+
+def _qkvp_v2_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
+    return _qkvp_run(lib, ws, inputs, params, v2=True)
+
+
 def default_fused_registry() -> FusedKernelRegistry:
     reg = FusedKernelRegistry()
     reg.register("chunk_h_scan", _Recipe(
@@ -521,6 +567,22 @@ def default_fused_registry() -> FusedKernelRegistry:
         src_dir=_KERNELS, src_file="qkv_fused_lib.cpp", defines=_qkv_defines,
         setup_sym="qkv_setup_v2", teardown_sym="qkv_teardown",
         bind=_qkv_bind, launch=_qkv_v2_launch, contract=_qkv_contract))
+    # qkvp_flash: per-dim (KDA/GLA) chunk_o flash — operand prescale + score + tril + A·v.
+    _qkvp_contract = FusedContract(
+        in_slots=["q", "k", "v", "coef_ag", "coef_bg"],
+        in_dtypes=[torch.float16, torch.float16, torch.float16, torch.float16, torch.float16],
+        out_names=["o"], out_dtype=torch.float32,
+        notes="per-dim chunk_o flash: o = tril((q⊙coef_ag)·(k⊙coef_bg)ᵀ)·v in ONE launch "
+              "(Vec prescale→Cube score→Vec tril→Cube A·v); ops+S+A L2-resident; "
+              "C,D,DV via -DQKV_C/_D/_DV; q/k/coef [M,C,D], v [M,C,DV], o [M,C,DV] f32")
+    reg.register("qkvp_flash_native", _Recipe(
+        src_dir=_KERNELS, src_file="qkv_prologue_fused_lib.cpp", defines=_qkv_defines,
+        setup_sym="qkvp_setup", teardown_sym="qkvp_teardown",
+        bind=_qkvp_bind, launch=_qkvp_launch, contract=_qkvp_contract))
+    reg.register("qkvp_flash_native_v2", _Recipe(
+        src_dir=_KERNELS, src_file="qkv_prologue_fused_lib.cpp", defines=_qkv_defines,
+        setup_sym="qkvp_setup_v2", teardown_sym="qkvp_teardown",
+        bind=_qkvp_bind, launch=_qkvp_v2_launch, contract=_qkvp_contract))
     return reg
 
 

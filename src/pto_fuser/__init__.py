@@ -24,9 +24,9 @@ from .policy import Policy, PlannedTransform
 from .report import CompilationReport, TransformRecord
 from .compile import CompileResult, compile_program
 from .analysis import (FusionAnalysis, FusionRegion, identify_fusion_regions)
-from .template import (EpilogueUnit, FuseChunkOFlash, FuseContractionEpilogue,
-                       Template, default_templates, epilogue_report,
-                       extract_epilogue_unit)
+from .template import (EpilogueUnit, FuseChunkOFlash, FusePerDimChunkOFlash,
+                       FuseContractionEpilogue, Template, default_templates,
+                       epilogue_report, extract_epilogue_unit)
 
 __all__ = [
     "TensorRef", "Node", "EinsumNode", "OpaqueNode", "VecGlueNode", "TensorOp",
@@ -48,5 +48,5 @@ __all__ = [
     # fusion-region analysis + template emission (toward megakernel generation)
     "FusionAnalysis", "FusionRegion", "identify_fusion_regions",
     "EpilogueUnit", "extract_epilogue_unit", "Template", "default_templates",
-    "FuseContractionEpilogue", "FuseChunkOFlash", "epilogue_report",
+    "FuseContractionEpilogue", "FuseChunkOFlash", "FusePerDimChunkOFlash", "epilogue_report",
 ]

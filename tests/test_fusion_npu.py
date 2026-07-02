@@ -120,6 +120,36 @@ def test_qkv_flash_matches_reference_and_v1_equals_v2():
     assert gate_determinism(lambda: {"o": reg.run("qkv_flash_native_v2", [q, k, v, gate, beta1], params)[0]}).passed
 
 
+def test_qkvp_flash_matches_reference_and_v1_equals_v2():
+    """The per-dim flash kernel (KDA/GLA chunk_o: prescale q⊙coef_ag, k⊙coef_bg → score
+    → tril → ·v in one launch) matches the fp32 staged reference for both variants, and
+    the double-buffered V2 (ops+S+A L2-resident) is bit-identical to the four-pass V1 —
+    the 4-stage Vec-Cube-Vec-Cube FFTS choreography is exact. Deterministic on each."""
+    from pto_fuser.fused import shared_fused_registry
+    torch.npu.set_device(DEV)
+    nc, H, C, D = 4, 4, 128, 128
+    M = nc * H
+    g = torch.Generator(device="cpu").manual_seed(5)
+    q = (torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    k = (torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    v = (torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    ag = torch.exp(torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    bg = (1.0 / ag.float()).half()
+    params = {"nc": nc, "H": H, "C": C, "D": D, "DV": D, "causal": True}
+    reg = shared_fused_registry()
+
+    rows = torch.arange(C, device=DEV)
+    mask = (rows[:, None] >= rows[None, :]).float()
+    S = (q * ag).float() @ (k * bg).float().transpose(-1, -2)
+    ref = ((S * mask).half().float()) @ v.float()
+
+    (o1,) = reg.run("qkvp_flash_native", [q, k, v, ag, bg], params)
+    (o2,) = reg.run("qkvp_flash_native_v2", [q, k, v, ag, bg], params)
+    assert frob_rel(o1, ref) < TOL and frob_rel(o2, ref) < TOL, "per-dim flash != reference"
+    assert torch.equal(o1, o2), "per-dim flash V2 (interleaved) != V1 (four-pass)"
+    assert gate_determinism(lambda: {"o": reg.run("qkvp_flash_native_v2", [q, k, v, ag, bg], params)[0]}).passed
+
+
 def test_fused_node_captures_and_replays_bitexact():
     torch.npu.set_device(DEV)
     torch.manual_seed(2)

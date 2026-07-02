@@ -91,7 +91,9 @@ def test_compile_gdn_unverified():
 def test_compile_kda_unverified():
     res = compile_program(_kda(), Features(1, 16, 8, 128, 128), verify=False)
     kernels = {n.kernel for n in res.program.nodes if isinstance(n, FusedNode)}
-    assert kernels == {"chunk_h_scan", "qk_prologue_v2"}
+    # per-dim chunk_o flashes (consuming the score the prologue template would have fused);
+    # scan + perdim-flash + 2 read levers = 4 kept.
+    assert kernels == {"chunk_h_scan", "qkvp_flash_native_v2"}
     assert len(res.report.kept) == 4
 
 

@@ -280,6 +280,18 @@ program without it stands.
   **standalone** transform, *not* part of the epilogue generator, so its per-shape
   keep/drop never disturbs the kkt fusion (bundling it once dropped the proven kkt fusion
   along with it — §8).
+- **`fuse-perdim-chunk-o-flash`** (`template.py`) — the **per-channel-gate twin** of the
+  scalar flash, extending the score→output fusion to the KDA/GLA family
+  (`kernels/qkv_prologue_fused.h`, `qkvp_flash_native_v2`). The per-dim decay rides on the
+  *operands* (a Vec prescale `q⊙coef_ag`, `k⊙coef_bg`) rather than a scalar epilogue, so
+  the pipeline gains a leading stage: **Vec prescale → Cube score → Vec tril → Cube A·v**,
+  a four-stage double-buffered ring with ops, S *and* A all L2-resident. It matches the
+  canonical per-dim chunk_o (the `q_eff`/`k_eff` prescale muls + Aqk + tril + contiguous +
+  `o_intra`), keeps `q_eff` (it also feeds `o_inter`), and reads `(qF, kF, v, coef_ag,
+  coef_bg)`. Reuses `prologue_fused`'s `prescale_one`/`mask_one` verbatim and the same two
+  matmul configs as the scalar flash — the only new device code is the 4-stage
+  choreography. Bit-exact (V2 bit-identical to V1) and a kept win under capture at large H
+  (KDA H16nc8 ≈2.7%, H32nc8 ≈3% end-to-end); disposed at small H, like the scalar flash.
 
 ### Structural — contraction+epilogue template emission (`template.py`, §8)
 
@@ -410,6 +422,18 @@ pattern):
    already covers the dispatch. Exactly the separated stack working as designed — a kernel
    that wins in one regime and not another is a localized, per-shape perf decision, never
    a correctness event or a regression to a neighbor.
+
+   *Then widened to the per-channel-gate family* (`fuse-perdim-chunk-o-flash`,
+   `qkvp_flash_native_v2`): KDA/GLA put the decay on the operands, so the flash gains a
+   leading Vec-prescale stage (Vec → Cube → Vec → Cube), a four-stage double-buffered
+   ring — but it reuses the prologue's prescale/mask and the same matmul configs, so the
+   only new device code is the choreography. Same discipline, same outcome: bit-exact,
+   kept under capture at large H (KDA ≈3% e2e), disposed at small H. It also exercised the
+   determinism gate for real — at H32nc8 the pre-existing intermittent scan FFTS race
+   (~1/10, documented in the scan work) trips the gate on the combined candidate and the
+   verifier falls back, even though the flash kernel itself is deterministic across 30
+   isolated runs. The gate protecting correctness against a *neighbor's* latent race,
+   without any change to the flash, is the discipline working end-to-end.
 
 **Deferred (not started; the eventual end goal).** Integration into the `cce-mlir`
 compiler stack, which operates on the lower-level CCE intrinsics below the pto tile
