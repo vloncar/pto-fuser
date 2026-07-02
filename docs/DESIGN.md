@@ -41,6 +41,46 @@ generator. §8 maps the controlled path from here to a megakernel-producing syst
 
 ---
 
+## Pipeline at a glance
+
+The path from a forward's definition to the executed device chain. Each band is
+detailed by the section noted on the right; the crucial property is that a transform
+never emits source — it swaps a subgraph of primitive nodes for a node that *names* an
+already-proven kernel, and graph capture folds the resulting chain into one dispatch.
+
+```
+   build_*_program(dims)  ──▶  Program = [ EinsumNode | VecGlueNode | OpaqueNode        §2  IR
+                                          | FusedNode | TensorOp ] + inputs/outputs
+                                             │
+       ┌─────────────────────────────────────┼─────────────────────────────────────┐
+       │  compile_program(program, Features, bindings)                              │  §3  separated
+       │     canonicalize ─▶ Policy/CostModel propose ─▶ verify (frob+det+faster)   │      compilation
+       │                                     │            ─▶ keep / roll back        │      stack
+       └─────────────────────────────────────┼─────────────────────────────────────┘
+                                             ▼
+                    lowered Program  +  CompilationReport (predicted vs measured)     §3.6
+                                             │
+                          GraphReplayExecutor.capture(...) ─▶ ONE NPUGraph replay     §4  backends
+                                             │      (the "emitted code": a captured
+                                             │       device launch-chain, not text)
+                                             ▼           per-node dispatch
+              EinsumNode  ─▶  pto-einsum library          (matmul core; §4)
+              FusedNode   ─▶  FusedKernelRegistry `.so`    (hosted proven kernel; §4, §6)
+              OpaqueNode  ─▶  OpaqueRegistry               (tri_inv; §2 dtype contract)
+              VecGlueNode ─▶  torch Vec op                 (mul/add/sub/scale/tril-mask)
+              TensorOp    ─▶  torch reshape/slice/…        (host plumbing, folds under capture)
+```
+
+The middle band — canonicalize → propose → verify → dispose — is the heart of the
+design and is expanded on its own in §3; the node types it rewrites are §2, the
+backends that execute the result are §4, and the transforms that do the rewriting are
+§6. The two dispatch paths that matter for the eventual `cce-mlir` port: an
+`EinsumNode` always goes to the frozen library, a `FusedNode` always names a
+pre-proven `.so` — new device capability enters through neither a transform nor a
+policy but only by first hand-proving a kernel (§8).
+
+---
+
 ## 2. Intermediate representation (`ir.py`)
 
 A `Program` is an ordered list of typed nodes over a name→tensor environment (the
