@@ -264,6 +264,22 @@ program without it stands.
   reusing `gated_qk_native_v2` (scalar gate) or `qk_prologue` (GLA per-channel). The gate
   kind is a forward-declared option (`Features.per_dim_gate`). This is the §8 B2 widening —
   more coverage for the proven kernels, no new device code.
+- **`fuse-chunk-o-flash`** (`template.py`) — the score→output "flash" fusion, and the
+  first **genuinely-new device kernel** the roadmap allows (`kernels/qkv_fused.h`,
+  `qkv_flash_native` / `_v2`). It folds the whole scalar-gate chunk_o — `q·kᵀ → gate/mask
+  → ·v` (Aqk einsum + `coef_o` mul + contiguous + the `o_intra` `A·v` contraction) — into
+  one Cube→Vec→Cube launch, recomputing the gate + causal mask on-chip, so the `[M,C,C]`
+  masked score never lands in HBM. The emitted kernel is the **double-buffered interleave
+  V2**: a two-slot per-core L2 ring where the Cube produces the *next* tile's score while
+  the Vec masks the current one, hiding the Cube↔Vec FFTS handshake, so **S and A are both
+  L2-resident** (the V1 two-pass materializes them and pays a round-trip — it is the
+  bit-exact oracle, not the emitted kernel). Hand-proved bit-exact (V2 bit-identical to
+  V1), and a **kept win under graph capture at large head count** (`H∈{16..64}`, ≈3–5%
+  end-to-end on GDN — the whole score→output slice) while the verifier **disposes it at
+  small H** (few tiles to overlap; capture already covers the dispatch). It is a
+  **standalone** transform, *not* part of the epilogue generator, so its per-shape
+  keep/drop never disturbs the kkt fusion (bundling it once dropped the proven kkt fusion
+  along with it — §8).
 
 ### Structural — contraction+epilogue template emission (`template.py`, §8)
 
@@ -365,6 +381,35 @@ pattern):
    widenings (cube+vec mix kernels, then a genuinely new device kernel such as the deferred
    fixpipe-1D scale) follow the same rule: hand-prove the pattern, then fold it in — the
    generator never emits an unproven kernel.
+4. **The first genuinely-new device kernel — chunk_o score→output "flash"** —
+   **realized** (`kernels/qkv_fused.h`, `qkv_flash_native`; the `fuse-chunk-o-flash`
+   transform in `template.py`). The residual-staging analysis showed every forward still
+   stages `o_intra = A·v` after B1/B2: the fused qk kernel writes the masked score `A`
+   `[M,C,C]` to HBM and a separate matmul reads it back. This kernel folds that second
+   contraction in — `q·kᵀ → gate/mask → ·v` as one Cube→Vec→Cube launch, reusing the
+   proven gated-qk epilogue (`kkt_epilogue_one`) between two matmul-core passes and adding
+   only a plain-NN output config. Hand-proved **bit-exact** (two-pass V1, and the
+   L2-resident interleaved V2 which is bit-identical — the 3-stage FFTS choreography is
+   exact) and **≈5× faster than the staged path un-captured**.
+
+   *Two things this step taught.* **(a) Standalone, independently-verified transform —
+   never bundle.** An early version emitted flash *inside* the epilogue generator; under
+   capture flash-V1 trades the small A round-trip for a larger S round-trip, so it is a
+   dispatch-regime win that ≈regresses captured, and the bundled generator's keep/drop is
+   atomic — the flash regression dragged the *proven kkt fusion* below the keep threshold
+   and the verifier dropped **both**. Split into its own transform, propose/verify/dispose
+   gates flash on its own merits with **zero collateral** to kkt. **(b) The captured win
+   needed cross-tile overlap, and it landed.** The sequential single-slot V2 was correct
+   and bit-identical but sync-bound (slower than V1). The emitted kernel is now the
+   **double-buffered V2**: a two-slot per-core L2 ring where the Cube produces the next
+   tile's score while the Vec masks the current one — the WAR hazards ordered for free by
+   the Cube's own instruction stream (no FREE flags), so **S and A stay L2-resident** and
+   the handshake is hidden. Result: flash V2 (still bit-identical to V1) is a **kept win
+   under capture at large head count** (`H∈{16..64}`, ≈3–5% end-to-end on GDN), and the
+   verifier disposes it at small H where there are too few tiles to overlap and capture
+   already covers the dispatch. Exactly the separated stack working as designed — a kernel
+   that wins in one regime and not another is a localized, per-shape perf decision, never
+   a correctness event or a regression to a neighbor.
 
 **Deferred (not started; the eventual end goal).** Integration into the `cce-mlir`
 compiler stack, which operates on the lower-level CCE intrinsics below the pto tile

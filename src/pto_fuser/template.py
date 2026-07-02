@@ -262,6 +262,77 @@ class FuseContractionEpilogue(Transform):
 
 
 # --------------------------------------------------------------------------- #
+#  chunk_o flash — score→output fused (B3), a STANDALONE transform
+# --------------------------------------------------------------------------- #
+class FuseChunkOFlash(Transform):
+    """Fuse the whole scalar-gate chunk_o score→output — ``q·kᵀ → gate/mask → ·v`` —
+    into ONE ``qkv_flash_native`` kernel, so the [M,C,C] masked score never lands in
+    HBM. Matches the canonical Aqk einsum + ``coef_o`` mul + contiguous + the o_intra
+    ``nij,nje->nie`` contraction and replaces all four with the flash FusedNode
+    (recomputing the exp gate + causal mask on-chip from g_native, so it reads
+    (qF, kF, v, g_native, beta_native_ones) — not the score).
+
+    It is a **separate** transform from `FuseContractionEpilogue`, and deliberately so:
+    under graph capture the o_intra dispatch is already elided and flash-V1 trades the
+    A round-trip for a larger S round-trip, so it is a *dispatch-regime* win (≈5× on the
+    un-captured / dynamic-shape path) but ≈parity-to-regression captured. Keeping it a
+    standalone, independently-verified transform means the propose/verify/dispose loop
+    drops it wherever it does not pay **without** disturbing the kkt fusion — which was
+    exactly the failure of bundling it into the epilogue generator. Ordered before
+    `fuse-contraction-epilogue`: if kept, chunk_o is already flashed and the generator
+    emits only kkt; if dropped, the generator emits the score-only chunk_o kernel."""
+
+    name = "fuse-chunk-o-flash"
+    summary = "chunk_o q·kᵀ → gate/mask → ·v -> one qkv_flash_native (score never in HBM)"
+
+    def __init__(self, B, H, nc, C, D) -> None:
+        self.dims = Dims(B, H, nc, C, D)
+
+    def _site(self, program: Program) -> Optional[Tuple[int, EpilogueUnit, int]]:
+        """(anchor_idx, unit, o_intra_idx) for the chunk_o score→output chain, else None."""
+        for i, n in enumerate(program.nodes):
+            if not (isinstance(n, EinsumNode) and n.equation == "nid,njd->nij"
+                    and n.inputs == ["qF", "kF"]):
+                continue
+            unit = extract_epilogue_unit(program, i)
+            if not (unit.epilogue_ops == ["mul", "contiguous"]
+                    and _glue_coef(unit, "mul") == "coef_o"):
+                continue
+            c = _single_consumer(program, unit.boundary_out)
+            if c is None:
+                continue
+            cn = program.nodes[c]
+            if (isinstance(cn, EinsumNode) and cn.equation == "nij,nje->nie"
+                    and cn.inputs[0] == unit.boundary_out):
+                return i, unit, c
+        return None
+
+    def match(self, program: Program) -> int:
+        return 1 if self._site(program) is not None else 0
+
+    def apply(self, program: Program) -> TransformResult:
+        site = self._site(program)
+        if site is None:
+            return TransformResult(program, False, 0, "no chunk_o score→output chain")
+        i, unit, c = site
+        o_intra = program.nodes[c]
+        v_name = o_intra.inputs[1]
+        # V2 (double-buffered interleave) keeps S+A L2-resident and hides the Cube↔Vec
+        # handshake — the variant that beats the captured staged path (V1 pays an S
+        # round-trip). The verifier still gates it; a slower shape falls back to canonical.
+        node = FusedNode(kernel="qkv_flash_native_v2",
+                         inputs=["qF", "kF", v_name, "g_native", "beta_native_ones"],
+                         outputs=[o_intra.output],
+                         params={"nc": self.dims.nc, "H": self.dims.H, "C": self.dims.C,
+                                 "D": self.dims.D, "DV": self.dims.D, "causal": True},
+                         subsumes=["chunk_o Aqk einsum + coef_o mul + contiguous + "
+                                   "o_intra A@v (masked score never in HBM)"])
+        drop = {i} | {j for j, _ in unit.epilogue} | {c}
+        prog = splice(program, drop, min(drop), [node])
+        return TransformResult(prog, True, 1, "emitted qkv_flash_native")
+
+
+# --------------------------------------------------------------------------- #
 #  reporting (which epilogues are template-eligible; the fixpipe-1D finding)
 # --------------------------------------------------------------------------- #
 @dataclass

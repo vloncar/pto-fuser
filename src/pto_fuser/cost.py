@@ -112,6 +112,14 @@ class CostModel:
             return Prediction(0.5 + 0.05 * feat.nc,
                               "batch nc per-chunk intra-scores into one proven kernel",
                               v2=v2)
+        if name == "fuse-chunk-o-flash":
+            # Chunk_o score→output fused into one kernel: a strong dispatch-regime win
+            # (the o_intra einsum + the masked-score HBM round-trip collapse into one
+            # launch — ~5× un-captured), but under graph capture the dispatch is already
+            # elided and flash-V1 adds an S round-trip, so the captured payoff is ~parity.
+            # Propose it (the verifier keeps it where dispatch dominates, drops it under
+            # capture); the standalone transform means a drop never disturbs the kkt fusion.
+            return Prediction(0.2, "chunk_o score→output in one launch (dispatch-regime win)")
         if name == "fuse-contraction-epilogue":
             # Region-driven glue absorption (contraction + epilogue -> one gated-matmul
             # kernel): keeps the qk matrix on-chip; the glue share grows with head count

@@ -339,6 +339,62 @@ def _native_defines(p: dict) -> Dict[str, int]:
             "KKT_C": p.get("C", KKT_C), "KKT_D": p.get("D", KKT_D)}
 
 
+# --------------------------------------------------------------------------- #
+#  qkv_flash — chunk_o score→output in ONE launch (B3). q·kᵀ → gate/mask → ·v,
+#  so the [M,C,C] masked score never lands in HBM. Reuses the gated_qk epilogue
+#  (kkt_epilogue_one) between two matmul-core passes; recomputes the exp gate +
+#  causal mask on-chip from g_native, so it subsumes the coef_o mul AND the o_intra
+#  A@v contraction the staged path runs as a separate einsum.
+#    V1 (qkv_flash_native)    — two-pass (bulk Cube/Vec/Cube, S+A via HBM scratch).
+#    V2 (qkv_flash_native_v2) — per-tile Cube-Vec-Cube ring, S+A L2-resident.
+#  V1 measured faster at the shapes tested; V2 is bit-identical (the round-trip win
+#  needs cross-tile overlap — a later tuning), so the template emits V1 by default.
+# --------------------------------------------------------------------------- #
+def _qkv_bind(lib: ctypes.CDLL) -> None:
+    _exec_args = [ctypes.c_void_p] * 6 + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    lib.qkv_setup.restype = ctypes.c_void_p
+    lib.qkv_setup_v2.restype = ctypes.c_void_p
+    lib.qkv_exec.argtypes = _exec_args
+    lib.qkv_exec_v2.argtypes = _exec_args
+    lib.qkv_teardown.argtypes = [ctypes.c_void_p]
+
+
+def _qkv_defines(p: dict) -> Dict[str, int]:
+    D = p.get("D", KKT_D)
+    return {"QKV_NC": p["nc"], "QKV_H": p["H"], "QKV_C": p.get("C", KKT_C),
+            "QKV_D": D, "QKV_DV": p.get("DV", D)}
+
+
+def _qkv_run(lib, ws, inputs, params, v2=False) -> List[torch.Tensor]:
+    """o = (tril((q·kᵀ)·exp(min(gᵢ-gⱼ,0)))) · v over all M=nc·H chunks, one launch.
+    Inputs (Program order) [q, k, v, g_native, beta_native]; q/k [.,C,D], v [.,C,DV],
+    g/beta per-row [.,C]. Output o [M,C,DV] fp32 (matches the o_intra einsum)."""
+    q, k, v, g_native, beta_native = inputs
+    C, D = params.get("C", KKT_C), params.get("D", KKT_D)
+    DV = params.get("DV", D)
+    M = params["nc"] * params["H"]
+    dev = q.device
+    q_f = q.reshape(M, C, D).contiguous().half()
+    k_f = k.reshape(M, C, D).contiguous().half()
+    v_f = v.reshape(M, C, DV).contiguous().half()
+    g_t = g_native.reshape(M, C).contiguous().float()
+    beta_t = beta_native.reshape(M, C).contiguous().half()
+    rows = torch.arange(C, device=dev)
+    mask = (rows[:, None] >= rows[None, :]).float().contiguous()      # causal incl diag
+    o = torch.zeros(M, C, DV, device=dev, dtype=torch.float32)
+    exec_fn = lib.qkv_exec_v2 if v2 else lib.qkv_exec
+    exec_fn(_vp(q_f), _vp(k_f), _vp(v_f), _vp(g_t), _vp(beta_t), _vp(mask), ws, _vp(o), _stream())
+    return [o]
+
+
+def _qkv_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
+    return _qkv_run(lib, ws, inputs, params, v2=False)
+
+
+def _qkv_v2_launch(lib, ws, inputs, params) -> List[torch.Tensor]:
+    return _qkv_run(lib, ws, inputs, params, v2=True)
+
+
 def default_fused_registry() -> FusedKernelRegistry:
     reg = FusedKernelRegistry()
     reg.register("chunk_h_scan", _Recipe(
@@ -449,6 +505,22 @@ def default_fused_registry() -> FusedKernelRegistry:
             out_names=["L"], out_dtype=torch.float16,
             notes="per-dim prologue, L2-resident ring (Vec prescale->Cube matmul from "
                   "slot->Vec mask); qd/kinv never hit HBM; C,D via -DPRO_C/-DPRO_D")))
+    # qkv_flash: chunk_o score→output fused (q·kᵀ → gate/mask → ·v), score never in HBM.
+    _qkv_contract = FusedContract(
+        in_slots=["q", "k", "v", "g_native", "beta_native"],
+        in_dtypes=[torch.float16, torch.float16, torch.float16, torch.float32, torch.float16],
+        out_names=["o"], out_dtype=torch.float32,
+        notes="chunk_o flash: o = tril((q·kᵀ)·exp(min(gᵢ-gⱼ,0)))·v in ONE launch; "
+              "recomputes the gate+causal mask on-chip (subsumes coef_o mul + o_intra "
+              "A@v); C,D,DV via -DQKV_C/_D/_DV; q/k [M,C,D], v [M,C,DV], o [M,C,DV] f32")
+    reg.register("qkv_flash_native", _Recipe(
+        src_dir=_KERNELS, src_file="qkv_fused_lib.cpp", defines=_qkv_defines,
+        setup_sym="qkv_setup", teardown_sym="qkv_teardown",
+        bind=_qkv_bind, launch=_qkv_launch, contract=_qkv_contract))
+    reg.register("qkv_flash_native_v2", _Recipe(
+        src_dir=_KERNELS, src_file="qkv_fused_lib.cpp", defines=_qkv_defines,
+        setup_sym="qkv_setup_v2", teardown_sym="qkv_teardown",
+        bind=_qkv_bind, launch=_qkv_v2_launch, contract=_qkv_contract))
     return reg
 
 

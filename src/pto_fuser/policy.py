@@ -26,8 +26,9 @@ from .transform import EnableDirectReads, EnableFusedStore, Transform
 # annotation levers would otherwise measure and then find gone).
 _ORDER = {
     "lower-resident-scan": 0, "lower-perdim-scan": 0,
-    "fuse-contraction-epilogue": 1, "batch-chunk-intra-score": 1,
-    "enable-direct-reads": 2, "enable-fused-store": 3,
+    "fuse-chunk-o-flash": 1,                                  # before the epilogue generator
+    "fuse-contraction-epilogue": 2, "batch-chunk-intra-score": 2,
+    "enable-direct-reads": 3, "enable-fused-store": 4,
 }
 
 
@@ -54,13 +55,14 @@ class Policy:
         to those that apply to the program at hand."""
         from .transforms import (BatchChunkIntraScore, LowerPerDimScan,
                                   LowerResidentScan)
-        from .template import FuseContractionEpilogue
+        from .template import FuseContractionEpilogue, FuseChunkOFlash
         B, H, nc, C, D = feat.B, feat.H, feat.nc, feat.C, feat.D
         v2 = self.cost.predict("fuse-contraction-epilogue", feat).v2
         intra_v2 = self.cost.predict("batch-chunk-intra-score", feat).v2
         return [
             LowerResidentScan(B, H, nc, C, D, feat.dtype),
             LowerPerDimScan(B, H, nc, C, D, feat.dtype),
+            FuseChunkOFlash(B, H, nc, C, D),
             FuseContractionEpilogue(B, H, nc, C, D, v2=v2),
             BatchChunkIntraScore(feat.N, nc, C, D, D,
                                  per_dim_gate=feat.per_dim_gate,

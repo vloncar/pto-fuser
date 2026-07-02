@@ -147,7 +147,8 @@ def test_gdn_resident_scan_transform():
 def test_gdn_gated_templates_emit():
     """The generator emits GDN's kkt and chunk_o contractions as their proven native
     gated-matmul kernels (kkt_gated_native / gated_qk_native, no transpose bridge);
-    v2 selects the FFTS-interleave kernels."""
+    v2 selects the FFTS-interleave kernels. (The chunk_o score→output flash is a
+    separate transform, `FuseChunkOFlash`, not this epilogue generator.)"""
     from pto_fuser import FusedNode, TensorOp, FuseContractionEpilogue
     from attention._gdn_full import build_gdn_program
     B, H, nc, C, D = 1, 4, 2, 128, 128

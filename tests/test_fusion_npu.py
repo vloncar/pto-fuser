@@ -88,6 +88,38 @@ def test_fused_kernels_deterministic():
     assert gate_determinism(lambda: ex.run(kprog, ki)).passed, "kkt fused NDET"
 
 
+def test_qkv_flash_matches_reference_and_v1_equals_v2():
+    """The B3 flash kernel (chunk_o q·kᵀ → gate/mask → ·v in one launch) matches the
+    fp32 staged reference for both variants, and the interleaved V2 (S/A L2-resident)
+    is bit-identical to the two-pass V1 — the 3-stage Cube-Vec-Cube FFTS choreography
+    is exact. Deterministic on each variant."""
+    from pto_fuser.fused import shared_fused_registry
+    torch.npu.set_device(DEV)
+    nc, H, C, D = 4, 4, 128, 128
+    M = nc * H
+    g = torch.Generator(device="cpu").manual_seed(3)
+    q = (torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    k = (torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    v = (torch.randn(M, C, D, generator=g) * 0.1).half().to(DEV)
+    gate = (torch.randn(M, C, generator=g) * 0.1).float().to(DEV)
+    beta1 = torch.ones(M, C, dtype=torch.float16, device=DEV)
+    params = {"nc": nc, "H": H, "C": C, "D": D, "DV": D, "causal": True}
+    reg = shared_fused_registry()
+
+    rows = torch.arange(C, device=DEV)
+    mask = (rows[:, None] >= rows[None, :]).float()
+    S = q.float() @ k.float().transpose(-1, -2)
+    coef = torch.exp(torch.clamp(gate[:, :, None] - gate[:, None, :], max=0.0))
+    ref = ((S * coef * mask).half().float()) @ v.float()
+
+    (o1,) = reg.run("qkv_flash_native", [q, k, v, gate, beta1], params)
+    (o2,) = reg.run("qkv_flash_native_v2", [q, k, v, gate, beta1], params)
+    assert frob_rel(o1, ref) < TOL and frob_rel(o2, ref) < TOL, "flash != reference"
+    assert torch.equal(o1, o2), "flash V2 (interleaved) != V1 (two-pass)"
+    assert gate_determinism(lambda: {"o": reg.run("qkv_flash_native", [q, k, v, gate, beta1], params)[0]}).passed
+    assert gate_determinism(lambda: {"o": reg.run("qkv_flash_native_v2", [q, k, v, gate, beta1], params)[0]}).passed
+
+
 def test_fused_node_captures_and_replays_bitexact():
     torch.npu.set_device(DEV)
     torch.manual_seed(2)

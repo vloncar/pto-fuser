@@ -77,13 +77,15 @@ def test_policy_prunes_by_match():
 def test_compile_gdn_unverified():
     res = compile_program(_gdn(), Features(1, 16, 8, 128, 128), verify=False)
     kernels = {n.kernel for n in res.program.nodes if isinstance(n, FusedNode)}
-    assert kernels == {"chunk_h_scan", "kkt_gated_native_v2", "gated_qk_native_v2"}
+    # chunk_o fuses score→output (qkv_flash_native_v2, the double-buffered interleave);
+    # the epilogue generator then emits only kkt (v2 gate), score already consumed.
+    assert kernels == {"chunk_h_scan", "kkt_gated_native_v2", "qkv_flash_native_v2"}
     # every surviving einsum promoted to a direct read
     assert all(n.read_mode == "auto" for n in res.program.nodes
                if isinstance(n, EinsumNode))
     assert not res.report.verified
-    # resident-scan + contraction-epilogue generator + 2 read levers = 4 transforms
-    assert len(res.report.kept) == len(res.report.records) == 4
+    # resident-scan + chunk-o-flash + contraction-epilogue + 2 read levers = 5 transforms
+    assert len(res.report.kept) == len(res.report.records) == 5
 
 
 def test_compile_kda_unverified():

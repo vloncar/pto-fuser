@@ -93,3 +93,24 @@ def test_generator_never_emits_without_a_template():
 def test_default_templates_are_registered():
     names = {t.name for t in default_templates()}
     assert names == {"kkt-gated-native", "chunk-o-gated-native", "qk-prologue"}
+
+
+def test_chunk_o_flash_transform():
+    """FuseChunkOFlash fuses GDN's chunk_o score→output (Aqk einsum + coef_o mul +
+    contiguous + o_intra A@v) into ONE qkv_flash_native node, distinct from the epilogue
+    generator; it matches only that scalar-gate chunk_o chain (not KDA's per-dim one)."""
+    from pto_fuser import EinsumNode, FusedNode, FuseChunkOFlash
+    gdn = _gdn()
+    t = FuseChunkOFlash(1, 4, 2, 128, 128)
+    assert t.match(gdn) == 1
+    assert t.match(_kda()) == 0                     # per-dim chunk_o -> no scalar match
+    prog = t.apply(gdn).program
+    flash = [n for n in prog.nodes if isinstance(n, FusedNode)
+             and n.kernel == "qkv_flash_native_v2"]
+    assert len(flash) == 1
+    assert flash[0].outputs == ["o_intra"] and flash[0].params.get("causal") is True
+    assert flash[0].inputs == ["qF", "kF", "vn_flat", "g_native", "beta_native_ones"]
+    # the score matmul + its glue + the o_intra matmul are all gone
+    assert not any(isinstance(n, EinsumNode) and n.output in ("Aqk", "o_intra")
+                   for n in prog.nodes)
+    assert t.match(prog) == 0                        # idempotent
