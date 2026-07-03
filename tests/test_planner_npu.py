@@ -3,7 +3,7 @@ contraction stages, and the lever-pinned program stays gated-green.
 
 Asserts the planner's contract, not a fixed speedup (timings vary by machine):
   * every decision is self-consistent — kept iff fired & gated & faster;
-  * the library's direct-read lowering is bit-equivalent to the Phase-A baseline
+  * the library's direct-read lowering is bit-equivalent to the input-transpose baseline
     on every stage (gated_ok), which is the correctness half of the lever;
   * the annotated DeltaNet program still matches the fp32 reference.
 """

@@ -6,7 +6,7 @@ it applies, gates the result, and reports one table + one bar plot of speedups:
 
   | feature              | what it removes                         | GDN stage measured |
   |----------------------|-----------------------------------------|--------------------|
-  | read-mode selection  | the Phase-A strided-gather copy         | the 4 contractions |
+  | read-mode selection  | the input-transpose strided-gather copy         | the 4 contractions |
   | graph capture        | per-stage host dispatch                  | chunk_h scan       |
   | resident state       | the per-chunk HBM round-trip of state S  | chunk_h scan       |
   | glue absorption      | the qk HBM round-trip (gated epilogue)   | kkt                |
@@ -37,7 +37,7 @@ from pto_fuser.forwards import (build_kkt_fused_program, build_scan_fused_progra
 
 
 def feature_read_mode(dev, B, H, nc, C, D):
-    """Read-mode selection on each GDN contraction: Phase-A → direct read."""
+    """Read-mode selection on each GDN contraction: input transpose → direct read."""
     rows = []
     planner = Planner()
     for name, prog, bindings in gdn_contraction_stages(B=B, nc=nc, H=H, C=C, D=D, device=dev):

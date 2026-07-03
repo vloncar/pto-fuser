@@ -11,7 +11,7 @@ lowering on identical inputs:
     edge) that a single-run frob check masks. Mandatory on any mega/fused/scan
     lowering.
 
-The gate is part of the planner loop, not a separate test phase: a lever that does
+The gate is part of the planner loop, not a separate testing step: a lever that does
 not pass is discarded and the default lowering stands.
 """
 from __future__ import annotations

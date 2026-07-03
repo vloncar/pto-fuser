@@ -51,7 +51,7 @@ def library_modes(read_mode: str = "auto", fuse_out: bool = True):
     The library auto-selects the read mode and the operand-swap-to-fused-store
     from the equation+layout; these env knobs only let the fuser *forbid* an
     optimization (to fall back to the always-valid baseline). `read_mode="NN"`
-    forces Phase-A (no direct read); `fuse_out=False` forbids the operand swap.
+    forces the input transpose (no direct read); `fuse_out=False` forbids the operand swap.
     The defaults (`"auto"`, `True`) set nothing — the library decides.
     """
     overrides = {}

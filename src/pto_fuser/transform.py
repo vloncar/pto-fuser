@@ -112,7 +112,7 @@ def splice(program: Program, drop: set, insert_at: int,
 # --------------------------------------------------------------------------- #
 def canonicalize(program: Program) -> Program:
     """The always-valid baseline every transform starts from: every `EinsumNode`
-    forced to the Phase-A **NN** read with **no** fused store. This is the lowering
+    forced to the input-transpose **NN** read with **no** fused store. This is the lowering
     the `StagedExecutor` honors unconditionally and the correctness reference the
     verifier gates against. Read-mode / fused-store selection is then reintroduced
     as the `EnableDirectReads` / `EnableFusedStore` transforms — so those levers are
@@ -131,7 +131,7 @@ def canonicalize(program: Program) -> Program:
 # --------------------------------------------------------------------------- #
 class EnableDirectReads(Transform):
     """Let the library pick its direct-read mode (NT / NN-strided / TN) instead of
-    the Phase-A NN baseline, on every `EinsumNode` still reading NN. Pure
+    the input-transpose NN baseline, on every `EinsumNode` still reading NN. Pure
     annotation: sets ``read_mode="auto"``. The library auto-selects *which* mode
     fires from the operand layout; whether it is faster than NN is the verifier's
     call (it is layout-dependent — huge on the head-strided GDN family, ~1.0x on the

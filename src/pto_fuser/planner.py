@@ -6,7 +6,7 @@ the equation+layout and exposes the documented toggles ``EINSUM_DISABLE_NT`` /
 library capabilities; it does not re-implement them. So the planner, for each
 distinct ``EinsumNode`` contraction:
 
-  1. measures the library's optimized lowering against the always-valid Phase-A
+  1. measures the library's optimized lowering against the always-valid input-transpose
      NN baseline on that node's real operands;
   2. **frob-gates** the two equivalent (the design — a broken lowering that produced
      zero/garbage would fail here);
@@ -197,7 +197,7 @@ class Planner:
 
 
 def _mode_name(in_nt: int) -> str:
-    return {0: "phaseA-NN", 1: "NT", 2: "NN-strided", 3: "TN"}.get(in_nt, f"in_nt={in_nt}")
+    return {0: "NN", 1: "NT", 2: "NN-strided", 3: "TN"}.get(in_nt, f"in_nt={in_nt}")
 
 
 def format_decisions(decisions: List[LeverDecision]) -> str:

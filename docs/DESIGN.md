@@ -130,7 +130,7 @@ is the only part that touches the device.
 
 ### 3.1 Canonical form (`canonicalize`)
 
-Every `EinsumNode` forced to the Phase-A **NN** read with **no** fused store — the
+Every `EinsumNode` forced to the input-transpose **NN** read with **no** fused store — the
 lowering the `StagedExecutor` honors unconditionally and the correctness reference the
 verifier gates against. The builders (`build_gdn_program`, `build_kda_program`,
 `forwards.build_deltanet_program`) emit exactly this all-staged form: every stage its
@@ -228,7 +228,7 @@ composes, captures, and hosts; it does not fork the core.
 tighter for pure-matmul) and `gate_determinism` (twice, bit-identical). `fusion.decide`
 composes them with a back-to-back measurement into a single keep/drop verdict, and the
 compile driver applies exactly this to every transform. The gate is part of the compile
-loop, not a separate test phase: a transform that does not pass is discarded and the
+loop, not a separate testing step: a transform that does not pass is discarded and the
 program without it stands.
 
 ---
@@ -238,14 +238,14 @@ program without it stands.
 ### Universal (annotation levers over any `EinsumNode`)
 
 - **`enable-direct-reads`** — `read_mode` NN → `auto`, letting the library pick its
-  direct-read mode (NT / NN-strided / TN) instead of Phase-A. Huge on the head-strided
-  GDN/KDA family (the head axis `h` is a non-innermost batch axis, so Phase-A pays a
+  direct-read mode (NT / NN-strided / TN) instead of the input transpose. Huge on the head-strided
+  GDN/KDA family (the head axis `h` is a non-innermost batch axis, so the input transpose pays a
   strided gather the direct read removes — measured **2.7–10.3×** on the GDN stages),
   ~1.0× on flat `[M,C,D]` families. The library auto-selects *which* mode fires; the
-  transform only proposes direct-read-vs-Phase-A, and the verifier keeps it per its
+  transform only proposes direct-read-vs-input-transpose, and the verifier keeps it per its
   measured, layout-dependent payoff.
 - **`enable-fused-store`** — `fuse_out` False → True, permitting the operand-swap that
-  exposes the fused permuted store when free1 is innermost (drops Phase C; 3.6–3.9× on
+  exposes the fused permuted store when free1 is innermost (drops the output transpose; 3.6–3.9× on
   `->bsht`, 2.11× when the swap fires).
 
 ### Structural — resident-state scan (`transforms/gdn.py` + `transforms/kda.py`)

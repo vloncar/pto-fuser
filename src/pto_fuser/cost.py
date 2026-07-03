@@ -90,13 +90,13 @@ class CostModel:
         name = transform_name
         if name == "enable-direct-reads":
             # Huge on the head-strided GDN/KDA family (h is a non-innermost batch
-            # axis → Phase-A pays a strided gather the direct read removes: measured
+            # axis → the input transpose pays a strided gather the direct read removes: measured
             # 2.7–10.3×); ~1.0× on flat [M,C,D] families. Cheap to verify, so always
             # worth trying; benefit ranked by how strided the batch is (head count).
             return Prediction(1.0 + 0.02 * feat.H,
-                              "direct read removes Phase-A strided gather on the head axis")
+                              "direct read removes the input-transpose strided gather on the head axis")
         if name == "enable-fused-store":
-            return Prediction(0.5, "fused permuted store drops Phase C when free1-innermost")
+            return Prediction(0.5, "fused permuted store drops the output transpose when free1-innermost")
         if name in ("lower-resident-scan", "lower-perdim-scan"):
             # Removes the per-chunk HBM round-trip of S — a bandwidth win that grows
             # with chunk count and fuses broadly (not just launch-bound: 4.40× at

@@ -16,7 +16,7 @@ in the IR only because the staged executor is host-driven.
 `read_mode` / `fuse_out` / `epilogue` / `prologue` on ``EinsumNode`` are **planner
 outputs**, not user input. The default lowering is always a correct execution; the
 The planner sets `read_mode` / `fuse_out` per node by measuring the library's
-direct-read / fused-store lowering against the always-valid Phase-A NN baseline and
+direct-read / fused-store lowering against the always-valid input-transpose NN baseline and
 keeping it only when gated-green and faster (see ``planner.py``). The executor
 honors these annotations via the library's documented mode toggles.
 """
@@ -60,7 +60,7 @@ class EinsumNode(Node):
     # documented toggles EINSUM_DISABLE_NT / EINSUM_DISABLE_OPERAND_SWAP. These two
     # fields *select among* those (see DESIGN.md), they do not re-implement them:
     #   read_mode = "auto" -> let the library pick the direct-read mode (default);
-    #               "NN"   -> force the always-valid Phase-A NN lowering.
+    #               "NN"   -> force the always-valid input-transpose NN lowering.
     #   fuse_out  = True   -> permit the operand-swap that exposes the fused store
     #               (default); False -> forbid the swap. The plain fused store still
     #               auto-fires when free1 is already innermost regardless of this.

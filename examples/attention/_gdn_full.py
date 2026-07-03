@@ -152,7 +152,7 @@ def build_gdn_program(B, H, nc, C, D, scale, work=torch.float16) -> Program:
     ``o`` [B,H,nc,C,D], inputs the flattened operands + gate coefficients from
     :func:`prepare_gdn_bindings`.
 
-    This is the always-valid Phase-A lowering: every stage its own einsum / glue node,
+    This is the always-valid input-transpose lowering: every stage its own einsum / glue node,
     the cross-chunk scan unrolled over chunks (the state ``S`` round-tripping HBM each
     chunk), no fused nodes. It is the correctness reference the verifier gates against
     and the starting point the transforms rewrite. The optimized lowerings —

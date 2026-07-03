@@ -3,8 +3,8 @@
 // Fused GDN `kkt` prototype.
 //
 // Demonstrates the auto-fuser thesis: drive the Cube contraction with the EINSUM
-// tile-matmul core (`matmul_one_tile_deep`, NT direct-read — no Phase A), then
-// replace Phase C with a *gated-mask epilogue* that applies the GDN decay/beta/
+// tile-matmul core (`matmul_one_tile_deep`, NT direct-read — no input transpose), then
+// replace the output transpose with a *gated-mask epilogue* that applies the GDN decay/beta/
 // causal-mask ON-CHIP, instead of as torch HBM glue. One mix-kernel launch.
 //
 //   [Cube]  qk = k @ k^T  (NT: both operands read straight from k, contraction
